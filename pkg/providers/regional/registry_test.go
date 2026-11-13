@@ -182,6 +182,46 @@ func TestRegionalOfferings(t *testing.T) {
 	g.Expect(factoryCalls).To(Equal(1))
 }
 
+func TestOmittedRegionsDoesNotHydrateRegionalState(t *testing.T) {
+	g := NewWithT(t)
+	ctx := testContext(t)
+	home := testProviders("eastus2", .4)
+	factoryCalls, networkCalls := 0, 0
+	registry := New("eastus2", home, func(string) *Providers {
+		factoryCalls++
+		return testProviders("westus2", .2)
+	}, func(context.Context, v1beta1.Region) error {
+		networkCalls++
+		return nil
+	})
+	nodeClass := testClass()
+	nodeClass.Spec.Regions = nil
+	types := &InstanceTypes{Provider: home.Types, Registry: registry}
+	images := &Images{NodeImageProvider: home.Images, Registry: registry}
+	// No Kubernetes client is needed on this path. An accidental placement read
+	// would fail instead of being hidden by another fake.
+	instances := &Instances{VMProvider: home.Instances, Registry: registry}
+	claim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{corev1.LabelTopologyRegion: "eastus2"}}}
+	for range 100 {
+		listed, err := types.List(ctx, nodeClass)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(listed[0]).To(BeIdenticalTo(home.Types.(*testTypes).types[0]))
+		resolved, err := images.List(ctx, nodeClass)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(&resolved[0]).To(BeIdenticalTo(&home.Images.(*testImages).images[0]))
+		_, err = instances.BeginCreate(ctx, nodeClass, claim, listed)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(instances.Delete(ctx, claim, "aks-claim")).To(Succeed())
+		g.Expect(registry.ValidateSubnets(ctx, nodeClass)).To(Succeed())
+	}
+	g.Expect(home.Instances.(*testVMs).calls).To(Equal(100))
+	g.Expect(home.Instances.(*testVMs).deletes).To(Equal(100))
+	g.Expect(home.Quota.(*testQuota).calls).To(BeZero())
+	g.Expect(factoryCalls).To(BeZero(), "regional caches and pricing workers are constructed only by this factory")
+	g.Expect(networkCalls).To(BeZero())
+	g.Expect(registry.entries).To(HaveLen(1), "only the pre-existing home provider is referenced")
+}
+
 func TestRegionalFailureIsolation(t *testing.T) {
 	g := NewWithT(t)
 	ctx := testContext(t)

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
@@ -301,11 +302,15 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		quotaProvider,
 	)
 
-	virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
-	lo.Must0(err, "creating regional VNet client")
-	networkValidator := &regional.NetworkValidator{
-		SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
-	}
+	regionalNetworkValidator := sync.OnceValues(func() (*regional.NetworkValidator, error) {
+		virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
+		if err != nil {
+			return nil, fmt.Errorf("creating regional VNet client: %w", err)
+		}
+		return &regional.NetworkValidator{
+			SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
+		}, nil
+	})
 	regions := regional.New(azConfig.Location, &regional.Providers{
 		Types: instanceTypeProvider, Images: imageProvider, Instances: vmInstanceProvider, Quota: quotaProvider,
 	}, func(location string) *regional.Providers {
@@ -332,7 +337,13 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 			options.FromContext(ctx).NodeResourceGroup, azConfig.SubscriptionID, options.FromContext(ctx).ProvisionMode,
 			options.FromContext(ctx).DiskEncryptionSetID, env, quotas)
 		return &regional.Providers{Types: types, Images: images, Instances: instances, Quota: quotas}
-	}, networkValidator.Validate)
+	}, func(ctx context.Context, region v1beta1.Region) error {
+		validator, err := regionalNetworkValidator()
+		if err != nil {
+			return err
+		}
+		return validator.Validate(ctx, region)
+	})
 
 	return ctx, &Operator{
 		Operator:                     operator,

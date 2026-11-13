@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -203,7 +204,7 @@ func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1
 	if err != nil {
 		return nil, err
 	}
-	newNodeClaim.Annotations = lo.Assign(newNodeClaim.Annotations, vmPromise.NodeClaimAnnotations)
+	maps.Copy(newNodeClaim.Annotations, vmPromise.NodeClaimAnnotations)
 	// Propagate single-value wellKnownLabels from the nodeClaim requirements to the labels.
 	// This is required for scheduling in core to work correctly. If this is not done, on subsequent scheduling passes before the Node is
 	// registered, the NodeClaim will not have the labels required to match the Pod and so a new NodeClaim will be created each time.
