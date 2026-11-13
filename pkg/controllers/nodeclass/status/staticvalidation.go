@@ -131,6 +131,7 @@ func NewStaticValidationReconciler(
 // Complex checks or checks that are dependent on external systems (e.g. calling Azure) should be performed in their own status controller.
 func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	validators := []validator{
+		r.validateRegions,
 		r.validateKubernetesVersion,
 		r.validateFIPS,
 		r.validateACLConfiguration,
@@ -163,6 +164,13 @@ func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v
 	// All validations passed - requeue to detect permission revocations
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeValidationSucceeded)
 	return reconcile.Result{RequeueAfter: ValidationSuccessRequeueInterval}, nil
+}
+
+func (r *StaticValidationReconciler) validateRegions(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (validationResult, error) {
+	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
+		return fail("MultiRegionUnsupportedConfiguration", err.Error()), nil
+	}
+	return pass(), nil
 }
 
 // Validates the Kubernetes version from AKSNodeClass to catch problems early before other validators

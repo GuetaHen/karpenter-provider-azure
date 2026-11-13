@@ -68,6 +68,7 @@ var _ = Describe("Hash", func() {
 			Expect(nodeClass.Hash()).To(Equal(hash))
 		},
 		Entry("Base AKSNodeClass", staticHash, v1beta1.AKSNodeClass{}),
+		Entry("empty regions pre-feature compatibility", staticHash, v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{Regions: []v1beta1.Region{}}}),
 
 		// Static fields, expect changed hash from base
 		Entry("VNETSubnetID", "13971920214979852468", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{VNETSubnetID: lo.ToPtr("subnet-id-2")}}),
@@ -126,6 +127,27 @@ var _ = Describe("Hash", func() {
 		Entry("GPU.Nvidia.ManagementMode", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{GPU: &v1beta1.GPU{Nvidia: &v1beta1.NvidiaGPU{ManagementMode: lo.ToPtr(v1beta1.ManagementModeManaged)}}}}),
 		Entry("NodePublicIP.Enabled", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{NodePublicIP: &v1beta1.NodePublicIP{Enabled: lo.ToPtr(true)}}}),
 	)
+	Context("Regions", func() {
+		It("should hash regional configuration without drifting pre-feature objects or mutating input", func() {
+			originalHash := nodeClass.Hash()
+			Expect(originalHash).To(Equal(staticHash))
+			nodeClass.Spec.Regions = []v1beta1.Region{
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+				{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+			}
+			original := nodeClass.DeepCopy()
+			hash := nodeClass.Hash()
+			Expect(hash).ToNot(Equal(originalHash))
+			Expect(nodeClass).To(Equal(original))
+			nodeClass.Spec.Regions[0], nodeClass.Spec.Regions[1] = nodeClass.Spec.Regions[1], nodeClass.Spec.Regions[0]
+			nodeClass.Spec.Regions[0].VNETSubnetID = strings.ToUpper(nodeClass.Spec.Regions[0].VNETSubnetID)
+			Expect(nodeClass.Hash()).To(Equal(hash))
+			nodeClass.Spec.Regions[0].VNETSubnetID += "-new"
+			Expect(nodeClass.Hash()).ToNot(Equal(hash))
+			nodeClass.Spec.Regions = nil
+			Expect(nodeClass.Hash()).To(Equal(originalHash))
+		})
+	})
 	Context("NodePublicIP", func() {
 		const (
 			prefixID      = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg/providers/Microsoft.Network/publicIPPrefixes/prefix"

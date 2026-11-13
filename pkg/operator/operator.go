@@ -72,6 +72,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/regional"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 	armopts "github.com/Azure/karpenter-provider-azure/pkg/utils/clientopts"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
@@ -102,7 +103,8 @@ type Operator struct {
 	LaunchTemplateProvider    *launchtemplate.Provider
 	PricingProvider           *pricing.Provider
 	InstanceTypesProvider     instancetype.Provider
-	VMInstanceProvider        *instance.DefaultVMProvider
+	VMInstanceProvider        instance.VMProvider
+	RegionalProviders         *regional.Registry
 	AKSMachineProvider        *instance.DefaultAKSMachineProvider
 	LoadBalancerProvider      *loadbalancer.Provider
 	QuotaProvider             *quota.DefaultProvider
@@ -299,18 +301,52 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		quotaProvider,
 	)
 
+	virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
+	lo.Must0(err, "creating regional VNet client")
+	networkValidator := &regional.NetworkValidator{
+		SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
+	}
+	regions := regional.New(azConfig.Location, &regional.Providers{
+		Types: instanceTypeProvider, Images: imageProvider, Instances: vmInstanceProvider, Quota: quotaProvider,
+	}, func(location string) *regional.Providers {
+		// Region-scoped providers own independent caches. Subscription-scoped ARM
+		// clients are shared; no mutable operator options are changed for a launch.
+		unavailable := azurecache.NewUnavailableOfferings()
+		prices := pricing.NewProvider(ctx, env, pricing.NewAPI(env.Cloud), location, operator.Elected())
+		quotas := quota.NewProvider(azClient.UsageClient, azClient.QuotaCategoryVMFamilyMappingClient, location, operator.Clock)
+		types := instancetype.NewDefaultProvider(location,
+			cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
+			azClient.SKUClient, prices, unavailable, quotas)
+		images := imagefamily.NewProvider(azClient.ImageVersionsClient, location, azConfig.SubscriptionID,
+			azClient.NodeImageVersionsClient, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
+		resolver := imagefamily.NewDefaultResolver(operator.GetClient(), images, types, azClient.NodeBootstrappingClient)
+		templates := launchtemplate.NewProvider(ctx, resolver, images, networkSecurityGroupProvider,
+			lo.Must(getCABundle(operator.GetConfig())), options.FromContext(ctx).ClusterEndpoint,
+			azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientID,
+			options.FromContext(ctx).NodeResourceGroup, location, options.FromContext(ctx).ProvisionMode)
+		// Cross-region selection uses the existing price/capacity ranker, not
+		// a home-region placement-score request or fabricated regional prices.
+		allocator := allocationstrategy.NewProvider(nil, consts.ComputeRecommendationModeDisabled)
+		instances := instance.NewDefaultVMProvider(azClient, types, allocator, templates,
+			loadBalancerProvider, networkSecurityGroupProvider, unavailable, location,
+			options.FromContext(ctx).NodeResourceGroup, azConfig.SubscriptionID, options.FromContext(ctx).ProvisionMode,
+			options.FromContext(ctx).DiskEncryptionSetID, env, quotas)
+		return &regional.Providers{Types: types, Images: images, Instances: instances, Quota: quotas}
+	}, networkValidator.Validate)
+
 	return ctx, &Operator{
 		Operator:                     operator,
 		InClusterKubernetesInterface: inClusterClient,
 		ManagedDynamicInterface:      managedDynamicClient,
 		UnavailableOfferingsCache:    unavailableOfferingsCache,
 		KubernetesVersionProvider:    kubernetesVersionProvider,
-		ImageProvider:                imageProvider,
+		ImageProvider:                &regional.Images{NodeImageProvider: imageProvider, Registry: regions},
 		ImageResolver:                imageResolver,
 		LaunchTemplateProvider:       launchTemplateProvider,
 		PricingProvider:              pricingProvider,
-		InstanceTypesProvider:        instanceTypeProvider,
-		VMInstanceProvider:           vmInstanceProvider,
+		InstanceTypesProvider:        &regional.InstanceTypes{Provider: instanceTypeProvider, Registry: regions},
+		VMInstanceProvider:           &regional.Instances{VMProvider: vmInstanceProvider, Registry: regions, KubeClient: operator.GetClient()},
+		RegionalProviders:            regions,
 		AKSMachineProvider:           aksMachineInstanceProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
 		QuotaProvider:                quotaProvider,

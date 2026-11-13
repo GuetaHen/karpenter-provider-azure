@@ -79,6 +79,7 @@ func NewController(
 	instanceTypes instanceTypeLister,
 	unavailableOfferings capacityReservationGroupOfferingsInvalidator,
 	systemNamespace string,
+	validateRegions ...func(context.Context, *v1beta1.AKSNodeClass) error,
 ) *Controller {
 	return &Controller{
 
@@ -86,7 +87,7 @@ func NewController(
 
 		kubernetesVersion:        NewKubernetesVersionReconciler(kubernetesVersionProvider),
 		nodeImage:                NewNodeImageReconciler(nodeImageProvider, inClusterKubernetesInterface, systemNamespace),
-		subnet:                   NewSubnetReconciler(subnetClient),
+		subnet:                   NewSubnetReconciler(subnetClient, validateRegions...),
 		validation:               NewStaticValidationReconciler(diskEncryptionSetsClient, parsedDiskEncryptionSetID),
 		localDNS:                 NewLocalDNSReconciler(managedKubernetesInterface, managedDynamicInterface, networkPolicy, networkPlugin),
 		capacityReservationGroup: NewCapacityReservationGroupReconciler(subscriptionID, location, capacityReservationGroupsClient, capacityReservationsClient, instanceTypes, unavailableOfferings),

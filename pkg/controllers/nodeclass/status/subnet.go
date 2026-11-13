@@ -34,13 +34,18 @@ import (
 )
 
 type SubnetReconciler struct {
-	subnetClient azapi.SubnetsAPI
+	subnetClient    azapi.SubnetsAPI
+	validateRegions func(context.Context, *v1beta1.AKSNodeClass) error
 }
 
-func NewSubnetReconciler(subnetClient azapi.SubnetsAPI) *SubnetReconciler {
-	return &SubnetReconciler{
+func NewSubnetReconciler(subnetClient azapi.SubnetsAPI, validateRegions ...func(context.Context, *v1beta1.AKSNodeClass) error) *SubnetReconciler {
+	r := &SubnetReconciler{
 		subnetClient: subnetClient,
 	}
+	if len(validateRegions) > 0 {
+		r.validateRegions = validateRegions[0]
+	}
+	return r
 }
 
 const (
@@ -58,6 +63,18 @@ const (
 )
 
 func (r *SubnetReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
+	if len(nodeClass.Spec.Regions) > 0 {
+		if r.validateRegions == nil {
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "MultiRegionUnavailable", "regional subnet validation is not configured")
+			return reconcile.Result{}, nil
+		}
+		if err := r.validateRegions(ctx, nodeClass); err != nil {
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "RegionalSubnetInvalid", err.Error())
+			return reconcile.Result{}, err
+		}
+		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
+		return reconcile.Result{RequeueAfter: healthyRequeueInterval}, nil
+	}
 	// TODO: Handle podSubnetID readiness here as well
 	return r.validateVNETSubnetID(ctx, nodeClass)
 }

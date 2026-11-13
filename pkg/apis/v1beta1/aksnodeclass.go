@@ -58,6 +58,23 @@ type ArtifactStreaming struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+// Region selects a physical Azure region and its pre-existing node subnet.
+type Region struct {
+	// name is the Azure location name, for example eastus2.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9]+$`
+	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MaxLength=64
+	// +required
+	Name string `json:"name,omitempty"`
+	// vnetSubnetID must belong to this region and the cluster's subscription.
+	// The subnet must have an NSG, outbound connectivity, and connectivity to the
+	// API server and every other node subnet. Karpenter does not create networks.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
+	// +required
+	VNETSubnetID string `json:"vnetSubnetID,omitempty"`
+}
+
 // CapacityReservationConfiguration configures the Capacity Reservation Group
 // that instances provisioned by this NodeClass target.
 type CapacityReservationConfiguration struct {
@@ -158,7 +175,20 @@ func (a *ArtifactStreaming) IsEnabled(arch string) bool {
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation requires imageFamily AzureLinux",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (has(self.imageFamily) && self.imageFamily == 'AzureLinux') : true"
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation is not supported with fipsMode FIPS",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (!has(self.fipsMode) || self.fipsMode != 'FIPS') : true"
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation is not supported with TrustedLaunch",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (!has(self.security) || !has(self.security.trustedLaunch) || !((has(self.security.trustedLaunch.vtpm) && self.security.trustedLaunch.vtpm) || (has(self.security.trustedLaunch.secureBoot) && self.security.trustedLaunch.secureBoot))) : true"
+// +kubebuilder:validation:XValidation:message="regions and vnetSubnetID are mutually exclusive",rule="!has(self.regions) || !has(self.vnetSubnetID)"
 type AKSNodeClassSpec struct {
+	// regions opts into experimental multi-region VM provisioning. Only listed
+	// regions are eligible; the cluster region is not implicitly included.
+	// Requires aksscriptless provisioning and a bring-your-own CNI (networkPlugin
+	// none) that connects all regions. Managed Azure CNI and AKS Machine API
+	// provisioning are not supported. Nodes are excluded from Azure load balancers.
+	// Omit this field to preserve the existing single-region behavior.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Regions []Region `json:"regions,omitempty"`
 	// vnetSubnetID is the subnet used by nics provisioned with this nodeclass.
 	// If not specified, we will use the default --vnet-subnet-id specified in karpenter's options config
 	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
@@ -991,6 +1021,7 @@ const AKSNodeClassHashVersion = "v3"
 
 func (in *AKSNodeClass) Hash() string {
 	spec := in.Spec.DeepCopy()
+	spec.Regions = normalizeRegionsForHash(spec.Regions)
 	if spec.CapacityReservation != nil {
 		spec.CapacityReservation.GroupID = lo.ToPtr(strings.ToLower(lo.FromPtr(spec.CapacityReservation.GroupID)))
 	}
@@ -1029,6 +1060,16 @@ func (in *AKSNodeClass) Hash() string {
 		IgnoreZeroValue: true,
 		ZeroNil:         true,
 	})))
+}
+
+func normalizeRegionsForHash(regions []Region) []Region {
+	if len(regions) == 0 {
+		return nil
+	}
+	for i := range regions {
+		regions[i].VNETSubnetID = strings.ToLower(regions[i].VNETSubnetID)
+	}
+	return regions
 }
 
 // AKSNodeClassList contains a list of AKSNodeClass

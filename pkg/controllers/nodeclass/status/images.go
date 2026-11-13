@@ -307,7 +307,7 @@ func overrideAnyGoalStateVersionsWithExisting(nodeClass *v1beta1.AKSNodeClass, d
 	// Note: we have to range over the discovered images here, instead of converting to a baseIDMapping, to keep the ordering consistent
 	for i := range discoveredImages {
 		discoveredImage := discoveredImages[i]
-		discoveredBaseImageID := trimVersionSuffix(discoveredImage.ID)
+		discoveredBaseImageID := imageBaseKey(discoveredImage)
 		if existingImage, ok := existingBaseIDMapping[discoveredBaseImageID]; ok {
 			updatedImages = append(updatedImages, *existingImage)
 		} else {
@@ -320,10 +320,24 @@ func overrideAnyGoalStateVersionsWithExisting(nodeClass *v1beta1.AKSNodeClass, d
 func mapImageBasesToImages(images []v1beta1.NodeImage) map[string]*v1beta1.NodeImage {
 	imagesBaseMapping := map[string]*v1beta1.NodeImage{}
 	for i := range images {
-		baseID := trimVersionSuffix(images[i].ID)
+		baseID := imageBaseKey(images[i])
 		imagesBaseMapping[baseID] = &images[i]
 	}
 	return imagesBaseMapping
+}
+
+func imageBaseKey(image v1beta1.NodeImage) string {
+	key := trimVersionSuffix(image.ID)
+	for _, requirement := range image.Requirements {
+		if requirement.Key == corev1.LabelTopologyRegion {
+			// The same gallery definition may be published at different versions
+			// in different regions, including while a maintenance window is closed.
+			regions := append([]string(nil), requirement.Values...)
+			sort.Strings(regions)
+			return key + "|" + strings.Join(regions, ",")
+		}
+	}
+	return key
 }
 
 // Trims off the version suffix, and leaves just the image base id

@@ -52,6 +52,14 @@ Karpenter provider for AKS can be used in two modes:
   * node image upgrades (Linux)
 * **Self-hosted mode**: Karpenter is run as a standalone deployment in the cluster. This mode is useful for advanced users who want to customize or experiment with Karpenter's deployment, use custom Helm charts, or integrate non-standard workflows. Self-hosted mode requires users to directly manage upgrades, token rotation, and helm charts.
 
+## Experimental multi-region fork
+
+This fork adds opt-in `AKSNodeClass.spec.regions` using the existing provider and
+controller, not a second autoscaler or a new NodeClass kind. See
+[multi-region provisioning](docs/multi-region.md) for prerequisites, limitations,
+build instructions, and the dedicated-cluster acceptance test. This is **not**
+managed NAP or managed Azure CNI support.
+
 ## Node memory reservations
 
 All provisioning modes (`aksscriptless`, `bootstrappingclient`, `aksmachineapi`,

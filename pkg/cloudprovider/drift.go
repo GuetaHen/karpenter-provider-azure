@@ -33,6 +33,7 @@ import (
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	corenodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
@@ -184,7 +185,7 @@ func (c *CloudProvider) isImageVersionDrifted(
 		}
 	} else {
 		for _, availableImage := range nodeImages {
-			if availableImage.ID == nodeClaim.Status.ImageID {
+			if availableImage.ID == nodeClaim.Status.ImageID && imageMatchesRegion(availableImage, nodeClaim.Labels[v1.LabelTopologyRegion]) {
 				return "", nil
 			}
 		}
@@ -194,6 +195,11 @@ func (c *CloudProvider) isImageVersionDrifted(
 		"driftType", ImageDrift,
 		"actualImageVersion", nodeClaim.Status.ImageID)
 	return ImageDrift, nil
+}
+
+func imageMatchesRegion(image v1beta1.NodeImage, region string) bool {
+	requirements := scheduling.NewNodeSelectorRequirements(image.Requirements...)
+	return !requirements.Has(v1.LabelTopologyRegion) || requirements.Get(v1.LabelTopologyRegion).Has(region)
 }
 
 // isKubeletIdentityDrifted returns drift if the kubelet identity has drifted

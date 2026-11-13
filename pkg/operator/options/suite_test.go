@@ -34,12 +34,39 @@ import (
 
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 )
 
 var ctx context.Context
+
+var _ = Describe("Multi-region configuration", func() {
+	DescribeTable("rejects unsupported modes without affecting unconfigured NodeClasses",
+		func(mode, plugin, pluginMode string, supported bool) {
+			opts := &options.Options{ProvisionMode: mode, NetworkPlugin: plugin, NetworkPluginMode: pluginMode}
+			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu")}}
+			Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+			nodeClass.Spec.Regions = []v1beta1.Region{{
+				Name:         "westus2",
+				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+			}}
+			if supported {
+				Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+			} else {
+				Expect(opts.ValidateRegions(nodeClass)).ToNot(Succeed())
+			}
+		},
+		Entry("scriptless BYO CNI", consts.ProvisionModeAKSScriptless, consts.NetworkPluginNone, "", true),
+		Entry("Machine API", consts.ProvisionModeAKSMachineAPI, consts.NetworkPluginNone, "", false),
+		Entry("Machine API batch", consts.ProvisionModeAKSMachineAPIHeaderBatch, consts.NetworkPluginNone, "", false),
+		Entry("bootstrapping client", consts.ProvisionModeBootstrappingClient, consts.NetworkPluginNone, "", false),
+		Entry("managed overlay", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay, false),
+		Entry("managed node subnet", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, "", false),
+		Entry("contradictory BYO mode", consts.ProvisionModeAKSScriptless, consts.NetworkPluginNone, consts.NetworkPluginModeOverlay, false),
+	)
+})
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)

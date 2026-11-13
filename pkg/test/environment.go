@@ -70,6 +70,7 @@ const (
 
 type Environment struct {
 	// API
+	AZClient                        *azclient.AZClient
 	VirtualMachinesAPI              *fake.VirtualMachinesAPI
 	AzureResourceGraphAPI           *fake.AzureResourceGraphAPI
 	VirtualMachineExtensionsAPI     *fake.VirtualMachineExtensionsAPI
@@ -335,6 +336,7 @@ func NewRegionalEnvironment(ctx context.Context, env *coretest.Environment, regi
 	networkSecurityGroupAPI.NSGs.Store(lo.FromPtr(nsg.ID), nsg)
 
 	return &Environment{
+		AZClient:                        azClient,
 		VirtualMachinesAPI:              virtualMachinesAPI,
 		AuxiliaryTokenServer:            auxiliaryTokenServer,
 		AzureResourceGraphAPI:           azureResourceGraphAPI,
