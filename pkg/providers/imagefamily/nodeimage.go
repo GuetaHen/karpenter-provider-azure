@@ -112,14 +112,19 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	if err != nil {
 		return []NodeImage{}, err
 	}
-	expiration := cache.DefaultExpiration
-	if communityFIPS && len(nodeImages) < len(supportedImages) {
-		// An image definition was skipped; list again soon in case it was missing only briefly.
-		expiration = PartialFIPSImageListExpiration
-	}
-	p.nodeImagesCache.Set(key, nodeImages, expiration)
+	p.nodeImagesCache.Set(key, nodeImages, listExpiration(communityFIPS, nodeImages, supportedImages))
 
 	return nodeImages, nil
+}
+
+// listExpiration is how long List caches nodeImages. A community gallery FIPS listing that skipped an image
+// definition is cached for PartialFIPSImageListExpiration only, so that a definition missing only briefly
+// returns soon; any other listing keeps the cache's default expiration.
+func listExpiration(communityFIPS bool, nodeImages []NodeImage, supportedImages []types.DefaultImageOutput) time.Duration {
+	if communityFIPS && len(nodeImages) < len(supportedImages) {
+		return PartialFIPSImageListExpiration
+	}
+	return cache.DefaultExpiration
 }
 
 func (p *provider) listImages(ctx context.Context, useSIG, communityFIPS bool, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
