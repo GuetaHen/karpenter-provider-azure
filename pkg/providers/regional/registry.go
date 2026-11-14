@@ -21,11 +21,7 @@ package regional
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"maps"
-	"reflect"
-	"sort"
 	"sync"
 	"time"
 
@@ -36,10 +32,21 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/log"
-	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
+	"sigs.k8s.io/karpenter/pkg/utils/pretty"
+)
+
+const (
+	// skuRefreshInterval matches the home-region instance type refresh.
+	skuRefreshInterval = 12 * time.Hour
+	// quotaRefreshInterval and quotaMaxStaleness match the home-region quota controller:
+	// stale quota is served until it is too old, then cleared so that it fails open.
+	quotaRefreshInterval = 10 * time.Minute
+	quotaMaxStaleness    = 15 * time.Minute
+	// retryBackoff bounds Azure calls for a region whose refresh keeps failing.
+	retryBackoff = time.Minute
 )
 
 type Providers struct {
@@ -49,28 +56,45 @@ type Providers struct {
 	Quota     quota.Provider
 }
 
+// entry tracks one region. A region is hydrated once its SKU catalog has loaded; after
+// that a failed refresh keeps serving the last successful data, as the home region does.
 type entry struct {
 	*Providers
-	mu           sync.Mutex
-	skusUpdated  time.Time
-	quotaUpdated time.Time
-	lastAttempt  time.Time
-	lastError    error
+	// external entries are refreshed by the home-region controllers, never here.
+	external bool
+
+	mu             sync.Mutex
+	hydrated       bool
+	skusErr        error
+	skusUpdated    time.Time
+	skusAttempted  time.Time
+	quotaUpdated   time.Time
+	quotaAttempted time.Time
 }
 
 type Registry struct {
 	home     string
 	factory  func(string) *Providers
 	validate func(context.Context, v1beta1.Region) error
-	mu       sync.Mutex
-	entries  map[string]*entry
+	clock    clock.Clock
+	catalogs catalogCache
+
+	mu      sync.Mutex
+	entries map[string]*entry
 }
 
 func New(home string, providers *Providers, factory func(string) *Providers, validate func(context.Context, v1beta1.Region) error) *Registry {
 	return &Registry{
-		home: home, factory: factory, validate: validate,
-		entries: map[string]*entry{home: {Providers: providers, skusUpdated: time.Now()}},
+		home: home, factory: factory, validate: validate, clock: clock.RealClock{},
+		catalogs: catalogCache{changes: pretty.NewChangeMonitor()},
+		entries:  map[string]*entry{home: {Providers: providers, external: true, hydrated: true}},
 	}
+}
+
+// WithClock sets the clock that schedules regional refreshes.
+func (r *Registry) WithClock(clk clock.Clock) *Registry {
+	r.clock = clk
+	return r
 }
 
 func (r *Registry) provider(region string) *entry {
@@ -84,32 +108,59 @@ func (r *Registry) provider(region string) *entry {
 	return p
 }
 
-// Only opted-in calls refresh regional state. A failed region is retried at most
-// once per minute and never borrows another region's quota or SKU catalog.
+// get returns a region's providers and refreshes them when due. Only opted-in calls
+// refresh regional state, and a failing refresh is retried at most once per backoff.
+// An error is returned only while a region has never loaded its SKU catalog.
 func (r *Registry) get(ctx context.Context, region string) (*entry, error) {
 	p := r.provider(region)
+	if p.external {
+		return p, nil
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.lastError != nil && time.Since(p.lastAttempt) < time.Minute {
-		return nil, p.lastError
+	now := r.clock.Now()
+	p.refreshSKUs(ctx, region, now)
+	if !p.hydrated {
+		return nil, fmt.Errorf("region %s has no SKU catalog yet: %w", region, p.skusErr)
 	}
-	p.lastAttempt = time.Now()
-	if time.Since(p.skusUpdated) >= 12*time.Hour {
-		if err := p.Types.UpdateInstanceTypes(ctx); err != nil {
-			p.lastError = fmt.Errorf("region %s SKUs: %w", region, err)
-			return nil, p.lastError
-		}
-		p.skusUpdated = time.Now()
-	}
-	if time.Since(p.quotaUpdated) >= 10*time.Minute {
-		if err := p.Quota.Update(ctx); err != nil {
-			p.lastError = fmt.Errorf("region %s quota: %w", region, err)
-			return nil, p.lastError
-		}
-		p.quotaUpdated = time.Now()
-	}
-	p.lastError = nil
+	p.refreshQuota(ctx, region, now)
 	return p, nil
+}
+
+func (p *entry) refreshSKUs(ctx context.Context, region string, now time.Time) {
+	due := !p.hydrated || now.Sub(p.skusUpdated) >= skuRefreshInterval
+	if !due || now.Sub(p.skusAttempted) < retryBackoff {
+		return
+	}
+	p.skusAttempted = now
+	if err := p.Types.UpdateInstanceTypes(ctx); err != nil {
+		p.skusErr = err
+		if p.hydrated {
+			log.FromContext(ctx).Error(err, "failed to refresh regional SKUs, serving the last successful catalog",
+				"region", region, "age", now.Sub(p.skusUpdated).String())
+		}
+		return
+	}
+	p.hydrated, p.skusErr, p.skusUpdated = true, nil, now
+}
+
+func (p *entry) refreshQuota(ctx context.Context, region string, now time.Time) {
+	if now.Sub(p.quotaUpdated) < quotaRefreshInterval || now.Sub(p.quotaAttempted) < retryBackoff {
+		return
+	}
+	p.quotaAttempted = now
+	if err := p.Quota.Update(ctx); err != nil {
+		// Quota that never loaded already fails open. Loaded quota is served until it is
+		// older than the home-region limit, then cleared so that it fails open too.
+		expired := !p.quotaUpdated.IsZero() && now.Sub(p.quotaUpdated) >= quotaMaxStaleness
+		log.FromContext(ctx).Error(err, "failed to refresh regional quota", "region", region,
+			"failingOpen", expired || p.quotaUpdated.IsZero())
+		if expired {
+			p.Quota.Reset()
+		}
+		return
+	}
+	p.quotaUpdated = now
 }
 
 func (r *Registry) ValidateSubnets(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
@@ -122,109 +173,6 @@ func (r *Registry) ValidateSubnets(ctx context.Context, nodeClass *v1beta1.AKSNo
 		}
 	}
 	return nil
-}
-
-type InstanceTypes struct {
-	instancetype.Provider
-	Registry *Registry
-}
-
-var regionalKeys = []string{
-	corev1.LabelTopologyRegion, corev1.LabelTopologyZone, karpv1.CapacityTypeLabelKey,
-	v1beta1.LabelPlacementScope, v1beta1.LabelUltraSSD,
-}
-
-func (p *InstanceTypes) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]*cloudprovider.InstanceType, error) {
-	if len(nodeClass.Spec.Regions) == 0 {
-		return p.Provider.List(ctx, nodeClass)
-	}
-	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
-		return nil, err
-	}
-	byName := map[string]*cloudprovider.InstanceType{}
-	var errs []error
-	for _, region := range nodeClass.Spec.Regions {
-		types, err := p.listRegion(ctx, nodeClass, region.Name)
-		if err != nil {
-			log.FromContext(ctx).Error(err, "excluding unavailable region", "region", region.Name)
-			errs = append(errs, err)
-			continue
-		}
-		if err := addRegion(byName, types, region.Name); err != nil {
-			return nil, err
-		}
-	}
-	if len(byName) == 0 && len(errs) != 0 {
-		return nil, errors.Join(errs...)
-	}
-	result := make([]*cloudprovider.InstanceType, 0, len(byName))
-	for _, it := range byName {
-		result = append(result, it)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
-	return result, nil
-}
-
-func (p *InstanceTypes) listRegion(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, region string) ([]*cloudprovider.InstanceType, error) {
-	provider, err := p.Registry.get(ctx, region)
-	if err != nil {
-		return nil, err
-	}
-	return provider.Types.List(ctx, nodeClass)
-}
-
-func addRegion(byName map[string]*cloudprovider.InstanceType, types []*cloudprovider.InstanceType, region string) error {
-	for _, it := range types {
-		scoped := it.DeepCopy()
-		for _, offering := range scoped.Offerings {
-			offering.Requirements.Add(scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, region))
-		}
-		if existing, ok := byName[it.Name]; ok {
-			if err := merge(existing, scoped); err != nil {
-				return err
-			}
-		} else {
-			byName[it.Name] = scoped
-		}
-	}
-	return nil
-}
-
-func merge(existing, other *cloudprovider.InstanceType) error {
-	if !reflect.DeepEqual(existing.Capacity, other.Capacity) || !reflect.DeepEqual(existing.Overhead, other.Overhead) {
-		return fmt.Errorf("SKU %s has inconsistent resources across regions", existing.Name)
-	}
-	left, right := maps.Clone(existing.Requirements), maps.Clone(other.Requirements)
-	for _, key := range regionalKeys {
-		delete(left, key)
-		delete(right, key)
-	}
-	if !sameRequirements(left, right) {
-		return fmt.Errorf("SKU %s has inconsistent capabilities across regions", existing.Name)
-	}
-	for _, key := range regionalKeys {
-		existing.Requirements.Get(key).Insert(other.Requirements.Get(key).Values()...)
-	}
-	existing.Offerings = append(existing.Offerings, other.Offerings...)
-	return nil
-}
-
-func sameRequirements(left, right scheduling.Requirements) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for key, requirement := range left {
-		if !right.Has(key) {
-			return false
-		}
-		a, b := requirement.NodeSelectorRequirement(), right.Get(key).NodeSelectorRequirement()
-		sort.Strings(a.Values)
-		sort.Strings(b.Values)
-		if !reflect.DeepEqual(a, b) {
-			return false
-		}
-	}
-	return true
 }
 
 type Images struct {

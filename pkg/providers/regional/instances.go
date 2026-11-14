@@ -35,8 +35,6 @@ import (
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 )
 
-const PlacementAnnotation = "karpenter.azure.com/region-placement"
-
 type Instances struct {
 	instance.VMProvider
 	Registry   *Registry
@@ -85,9 +83,11 @@ func (p *Instances) readClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim) 
 func (p *Instances) resolvePlacement(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, stored *karpv1.NodeClaim, types []*cloudprovider.InstanceType) (v1beta1.Region, error) {
 	var placement v1beta1.Region
 	if raw := stored.Annotations[PlacementAnnotation]; raw != "" {
-		if err := json.Unmarshal([]byte(raw), &placement); err != nil {
-			return placement, fmt.Errorf("decoding persisted regional placement: %w", err)
+		decoded, err := DecodePlacement(raw)
+		if err != nil {
+			return placement, err
 		}
+		placement = decoded
 	}
 	placement, err := p.existingPlacement(ctx, nodeClass, stored, placement)
 	if err != nil {
@@ -129,9 +129,7 @@ func (p *Instances) existingPlacement(ctx context.Context, nodeClass *v1beta1.AK
 }
 
 func (p *Instances) persistPlacement(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, stored *karpv1.NodeClaim, placement v1beta1.Region) error {
-	if _, ok := lo.Find(nodeClass.Spec.Regions, func(r v1beta1.Region) bool {
-		return r.Name == placement.Name && strings.EqualFold(r.VNETSubnetID, placement.VNETSubnetID)
-	}); !ok {
+	if !PlacementAllowed(nodeClass.Spec.Regions, placement) {
 		return fmt.Errorf("persisted regional placement no longer matches spec.regions; recreate the NodeClaim to select another region")
 	}
 	if err := p.Registry.validate(ctx, placement); err != nil {
@@ -195,8 +193,8 @@ func narrow(types []*cloudprovider.InstanceType, region string) []*cloudprovider
 }
 
 func (p *Instances) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim, name string) error {
-	region := nodeClaim.Labels[corev1.LabelTopologyRegion]
-	if region == "" || region == p.Registry.home {
+	region := strings.ToLower(nodeClaim.Labels[corev1.LabelTopologyRegion])
+	if region == "" || strings.EqualFold(region, p.Registry.home) {
 		return p.VMProvider.Delete(ctx, nodeClaim, name)
 	}
 	// Deletion must not depend on quota/SKU refresh, network validation, or the

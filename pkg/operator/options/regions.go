@@ -35,6 +35,9 @@ func (o *Options) ValidateRegions(nodeClass *v1beta1.AKSNodeClass) error {
 	if len(nodeClass.Spec.Regions) == 0 {
 		return nil
 	}
+	if !o.EnableMultiRegion {
+		return fmt.Errorf("spec.regions requires the controller option --enable-multi-region (ENABLE_MULTI_REGION=true)")
+	}
 	if err := o.validateRegionalMode(); err != nil {
 		return err
 	}

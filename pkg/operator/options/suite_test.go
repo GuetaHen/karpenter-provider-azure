@@ -43,9 +43,18 @@ import (
 var ctx context.Context
 
 var _ = Describe("Multi-region configuration", func() {
+	It("rejects spec.regions unless the controller enables multi-region provisioning", func() {
+		opts := &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone}
+		nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu")}}
+		Expect(opts.ValidateRegions(nodeClass)).To(Succeed(), "NodeClasses without regions are unaffected")
+		nodeClass.Spec.Regions = []v1beta1.Region{{Name: "westus2", VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}}
+		Expect(opts.ValidateRegions(nodeClass)).To(MatchError(ContainSubstring("--enable-multi-region")))
+		opts.EnableMultiRegion = true
+		Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+	})
 	DescribeTable("rejects unsupported modes without affecting unconfigured NodeClasses",
 		func(mode, plugin, pluginMode string, supported bool) {
-			opts := &options.Options{ProvisionMode: mode, NetworkPlugin: plugin, NetworkPluginMode: pluginMode}
+			opts := &options.Options{ProvisionMode: mode, NetworkPlugin: plugin, NetworkPluginMode: pluginMode, EnableMultiRegion: true}
 			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu")}}
 			Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
 			nodeClass.Spec.Regions = []v1beta1.Region{{
@@ -103,6 +112,7 @@ var _ = Describe("Options", func() {
 		"ENABLE_FIPS",
 		"AKS_MACHINES_POOL_NAME",
 		"MANAGE_EXISTING_AKS_MACHINES",
+		"ENABLE_MULTI_REGION",
 		"PROVIDER_BATCH_IDLE_DURATION",
 		"PROVIDER_BATCH_MAX_DURATION",
 		"PROVIDER_BATCH_MAX_SIZE",
@@ -229,6 +239,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("ENABLE_FIPS", "true")
 			os.Setenv("AKS_MACHINES_POOL_NAME", "mpool")
 			os.Setenv("MANAGE_EXISTING_AKS_MACHINES", "true")
+			os.Setenv("ENABLE_MULTI_REGION", "true")
 			os.Setenv("PROVIDER_BATCH_IDLE_DURATION", "1500ms")
 			os.Setenv("PROVIDER_BATCH_MAX_DURATION", "6s")
 			os.Setenv("PROVIDER_BATCH_MAX_SIZE", "42")
@@ -264,6 +275,7 @@ var _ = Describe("Options", func() {
 				EnableFIPS:                     lo.ToPtr(true),
 				ClusterDNSServiceIP:            lo.ToPtr("10.244.0.1"),
 				ManageExistingAKSMachines:      lo.ToPtr(true),
+				EnableMultiRegion:              lo.ToPtr(true),
 				AKSMachinesPoolName:            lo.ToPtr("mpool"),
 				ProviderBatchIdleDuration:      lo.ToPtr(1500 * time.Millisecond),
 				ProviderBatchMaxDuration:       lo.ToPtr(6 * time.Second),
@@ -653,6 +665,7 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.ManageExistingAKSMachines).To(BeFalse())
+			Expect(opts.EnableMultiRegion).To(BeFalse(), "multi-region provisioning is opt-in")
 		})
 
 		It("should succeed with manage-existing-aks-machines set", func() {
@@ -964,6 +977,7 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.ManageExistingAKSMachines).To(BeFalse())
+			Expect(opts.EnableMultiRegion).To(BeFalse(), "multi-region provisioning is opt-in")
 		})
 
 		It("should succeed with manage-existing-aks-machines set", func() {

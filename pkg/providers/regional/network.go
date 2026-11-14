@@ -20,12 +20,15 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
 	"github.com/samber/lo"
+	"k8s.io/utils/clock"
 )
 
 type VirtualNetworksAPI interface {
@@ -36,9 +39,45 @@ type NetworkValidator struct {
 	SubscriptionID  string
 	VirtualNetworks VirtualNetworksAPI
 	Subnets         azapi.SubnetsAPI
+	// Clock defaults to the real clock.
+	Clock clock.Clock
+
+	mu        sync.Mutex
+	validated map[string]time.Time
 }
 
+// validationTTL lets bursts of launches and status reconciles share one successful
+// check per region and subnet without hiding a broken subnet for long.
+const validationTTL = time.Minute
+
+// Validate checks a regional subnet, reusing a success for validationTTL. Failures are
+// never cached, so a repaired subnet is accepted on the next call.
 func (v *NetworkValidator) Validate(ctx context.Context, region v1beta1.Region) error {
+	clk := v.Clock
+	if clk == nil {
+		clk = clock.RealClock{}
+	}
+	key := region.Name + "|" + strings.ToLower(region.VNETSubnetID)
+	now := clk.Now()
+	v.mu.Lock()
+	validatedAt, ok := v.validated[key]
+	v.mu.Unlock()
+	if ok && now.Sub(validatedAt) < validationTTL {
+		return nil
+	}
+	if err := v.validate(ctx, region); err != nil {
+		return err
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.validated == nil || len(v.validated) >= 64 {
+		v.validated = map[string]time.Time{}
+	}
+	v.validated[key] = now
+	return nil
+}
+
+func (v *NetworkValidator) validate(ctx context.Context, region v1beta1.Region) error {
 	id, err := arm.ParseResourceID(region.VNETSubnetID)
 	if err != nil {
 		return err

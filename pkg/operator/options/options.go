@@ -128,6 +128,10 @@ type Options struct {
 	// If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect if PROVISION_MODE is already an AKS Machine API mode, as it will behave as if this option is set to true.
 	ManageExistingAKSMachines bool `json:"manageExistingAKSMachines,omitempty"`
 
+	// EnableMultiRegion gates the experimental AKSNodeClass spec.regions field. When false,
+	// no regional providers are constructed and NodeClasses that set spec.regions are not ready.
+	EnableMultiRegion bool `json:"enableMultiRegion,omitempty"`
+
 	AKSMachinesPoolName       string        `json:"aksMachinesPoolName,omitempty"`       // The name of the agent pool for the AKS machine API, assuming that all machines belong to the same agent pool. Only used on AKS machine API provision modes.
 	ProviderBatchIdleDuration time.Duration `json:"providerBatchIdleDuration,omitempty"` // Idle duration for provider batch accumulation (default 1s). Only used on provision mode aksmachineapiheaderbatch.
 	ProviderBatchMaxDuration  time.Duration `json:"providerBatchMaxDuration,omitempty"`  // Maximum duration for provider batch accumulation (default 5s). Only used on provision mode aksmachineapiheaderbatch.
@@ -165,6 +169,7 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.DiskEncryptionSetID, "node-osdisk-diskencryptionset-id", env.WithDefaultString("NODE_OSDISK_DISKENCRYPTIONSET_ID", ""), "The ARM resource ID of the disk encryption set to use for customer-managed key (BYOK) encryption.")
 	fs.BoolVar(&o.EnableFIPS, "enable-fips", env.WithDefaultBool("ENABLE_FIPS", false), "If set to true, AKSNodeClasses must explicitly enable FIPS mode. This setting mirrors the AKS cluster-level FIPS configuration.")
 	fs.BoolVar(&o.ManageExistingAKSMachines, "manage-existing-aks-machines", env.WithDefaultBool("MANAGE_EXISTING_AKS_MACHINES", false), "If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect when already on an AKS Machine API mode.")
+	fs.BoolVar(&o.EnableMultiRegion, "enable-multi-region", env.WithDefaultBool("ENABLE_MULTI_REGION", false), "Experimental. If set to true, AKSNodeClasses may set spec.regions to provision VMs in other Azure regions. When false, regional providers are not constructed and NodeClasses that set spec.regions are not ready.")
 	fs.StringVar(&o.AKSMachinesPoolName, "aks-machines-pool-name", env.WithDefaultString("AKS_MACHINES_POOL_NAME", ""), "The name of the agent pool that the AKS machines are/will be in with AKS machine API provision modes. Existing AKS machines outside of this pool will be ignored. Required when PROVISION_MODE is an AKS machine API mode. Must be <= 6 characters if the pool will host Windows nodes, because the AKS RP composes the Windows computer name from the pool and machine names and that is bounded by the NetBIOS limit.")
 	fs.DurationVar(&o.ProviderBatchIdleDuration, "provider-batch-idle-duration", env.WithDefaultDuration("PROVIDER_BATCH_IDLE_DURATION", time.Second), "Idle duration for provider batch accumulation. Use Go duration format such as `1s`. Only used on provision mode aksmachineapiheaderbatch.")
 	fs.DurationVar(&o.ProviderBatchMaxDuration, "provider-batch-max-duration", env.WithDefaultDuration("PROVIDER_BATCH_MAX_DURATION", 5*time.Second), "Maximum duration for provider batch accumulation. Use Go duration format such as `1s`. Only used on provision mode aksmachineapiheaderbatch.")

@@ -29,11 +29,11 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/regional"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
-	"sigs.k8s.io/karpenter/pkg/scheduling"
 	corenodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 )
 
@@ -43,6 +43,9 @@ const (
 	ImageDrift           cloudprovider.DriftReason = "ImageDrift"
 	KubeletIdentityDrift cloudprovider.DriftReason = "KubeletIdentityDrift"
 	ClusterConfigDrift   cloudprovider.DriftReason = "ClusterConfigDrift" // This is a catch-all for cluster-level config changes (e.g., from PUT ManagedCluster), where Karpenter does not directly "own" them.
+
+	// RegionalPlacementDrift replaces NodeClaims whose region and subnet are no longer listed in spec.regions.
+	RegionalPlacementDrift cloudprovider.DriftReason = "RegionalPlacementDrift"
 
 	// TODO (charliedmcb): Use this const across code and test locations which are signaling/checking for "no drift"
 	NoDrift cloudprovider.DriftReason = ""
@@ -61,6 +64,7 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 	if _, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
 		checks = []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error){
 			c.areStaticFieldsDrifted,
+			c.isRegionalPlacementDrifted,
 			c.isK8sVersionDrifted,
 			c.isImageVersionDrifted,
 			c.isMachineDrifted,
@@ -69,6 +73,7 @@ func (c *CloudProvider) isNodeClassDrifted(ctx context.Context, nodeClaim *karpv
 		// For legacy nodes
 		checks = []func(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error){
 			c.areStaticFieldsDrifted,
+			c.isRegionalPlacementDrifted,
 			c.isK8sVersionDrifted,
 			c.isKubeletIdentityDrifted,
 			c.isImageVersionDrifted,
@@ -185,7 +190,7 @@ func (c *CloudProvider) isImageVersionDrifted(
 		}
 	} else {
 		for _, availableImage := range nodeImages {
-			if availableImage.ID == nodeClaim.Status.ImageID && imageMatchesRegion(availableImage, nodeClaim.Labels[v1.LabelTopologyRegion]) {
+			if availableImage.ID == nodeClaim.Status.ImageID && regional.ImageMatchesRegion(availableImage.Requirements, nodeClaim.Labels[v1.LabelTopologyRegion]) {
 				return "", nil
 			}
 		}
@@ -197,9 +202,16 @@ func (c *CloudProvider) isImageVersionDrifted(
 	return ImageDrift, nil
 }
 
-func imageMatchesRegion(image v1beta1.NodeImage, region string) bool {
-	requirements := scheduling.NewNodeSelectorRequirements(image.Requirements...)
-	return !requirements.Has(v1.LabelTopologyRegion) || requirements.Get(v1.LabelTopologyRegion).Has(region)
+// isRegionalPlacementDrifted compares the placement recorded before launch with
+// spec.regions. Regions are excluded from the NodeClass hash, so only NodeClaims whose
+// own region or subnet is no longer listed are replaced.
+func (c *CloudProvider) isRegionalPlacementDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
+	reason := regional.PlacementDrift(nodeClass.Spec.Regions, nodeClaim.Annotations[regional.PlacementAnnotation])
+	if reason == "" {
+		return NoDrift, nil
+	}
+	log.FromContext(ctx).V(1).Info("drift triggered by regional placement", "driftType", RegionalPlacementDrift, "reason", reason)
+	return RegionalPlacementDrift, nil
 }
 
 // isKubeletIdentityDrifted returns drift if the kubelet identity has drifted

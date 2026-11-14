@@ -110,7 +110,7 @@ func main() {
 			options.FromContext(ctx).ParsedDiskEncryptionSetID,
 			options.FromContext(ctx).NetworkPolicy,
 			options.FromContext(ctx).NetworkPlugin,
-			op.RegionalProviders.ValidateSubnets,
+			op.RegionalSubnetValidator(),
 		)...).
 		Start(ctx)
 }

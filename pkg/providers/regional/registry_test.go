@@ -21,6 +21,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
@@ -36,6 +37,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
+	clocktesting "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -46,22 +48,25 @@ import (
 
 type testTypes struct {
 	instancetype.Provider
-	types []*cloudprovider.InstanceType
-	err   error
+	types     []*cloudprovider.InstanceType
+	err       error
+	updateErr error
+	updates   int
 }
 
 func (p *testTypes) List(context.Context, *v1beta1.AKSNodeClass) ([]*cloudprovider.InstanceType, error) {
 	return p.types, p.err
 }
-func (p *testTypes) UpdateInstanceTypes(context.Context) error { return p.err }
+func (p *testTypes) UpdateInstanceTypes(context.Context) error { p.updates++; return p.updateErr }
 
 type testQuota struct {
 	quota.Provider
-	err   error
-	calls int
+	err           error
+	calls, resets int
 }
 
 func (p *testQuota) Update(context.Context) error { p.calls++; return p.err }
+func (p *testQuota) Reset()                       { p.resets++ }
 
 type testImages struct{ images []imagefamily.NodeImage }
 
@@ -107,7 +112,7 @@ func testClass() *v1beta1.AKSNodeClass {
 
 func testContext(t *testing.T) context.Context {
 	t.Helper()
-	return options.ToContext(t.Context(), &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone})
+	return options.ToContext(t.Context(), &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone, EnableMultiRegion: true})
 }
 
 func testType(region string, price float64, available bool) *cloudprovider.InstanceType {
@@ -222,25 +227,53 @@ func TestOmittedRegionsDoesNotHydrateRegionalState(t *testing.T) {
 	g.Expect(registry.entries).To(HaveLen(1), "only the pre-existing home provider is referenced")
 }
 
-func TestRegionalFailureIsolation(t *testing.T) {
+func TestColdRegionFailsTheNodeClassInsteadOfServingAPartialCatalog(t *testing.T) {
 	g := NewWithT(t)
 	ctx := testContext(t)
 	home, remote := testProviders("eastus2", .4), testProviders("westus2", .2)
-	remote.Quota.(*testQuota).err = errors.New("quota API unavailable")
-	registry := New("eastus2", home, func(string) *Providers { return remote }, nil)
-	provider := &InstanceTypes{Provider: home.Types, Registry: registry}
+	remoteTypes := remote.Types.(*testTypes)
+	remoteTypes.updateErr = errors.New("SKU API unavailable")
+	clk := clocktesting.NewFakeClock(time.Now())
+	provider := &InstanceTypes{Provider: home.Types, Registry: New("eastus2", home, func(string) *Providers { return remote }, nil).WithClock(clk)}
 	for range 2 {
+		_, err := provider.List(ctx, testClass())
+		g.Expect(err).To(MatchError(ContainSubstring("region westus2 has no SKU catalog yet: SKU API unavailable")))
+	}
+	g.Expect(remoteTypes.updates).To(Equal(1), "a cold region is retried at most once per backoff")
+	remoteTypes.updateErr = nil
+	clk.Step(retryBackoff)
+	types, err := provider.List(ctx, testClass())
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(types[0].Requirements.Get(corev1.LabelTopologyRegion).Values()).To(ConsistOf("eastus2", "westus2"))
+	g.Expect(home.Quota.(*testQuota).calls).To(BeZero(), "home-region controllers own home refreshes")
+}
+
+func TestHydratedRegionServesLastGoodDataWhenRefreshFails(t *testing.T) {
+	g := NewWithT(t)
+	ctx := testContext(t)
+	home, remote := testProviders("eastus2", .4), testProviders("westus2", .2)
+	remoteTypes, remoteQuota := remote.Types.(*testTypes), remote.Quota.(*testQuota)
+	clk := clocktesting.NewFakeClock(time.Now())
+	provider := &InstanceTypes{Provider: home.Types, Registry: New("eastus2", home, func(string) *Providers { return remote }, nil).WithClock(clk)}
+	listedRegions := func() []string {
 		types, err := provider.List(ctx, testClass())
 		g.Expect(err).ToNot(HaveOccurred())
-		g.Expect(types).To(HaveLen(1))
-		g.Expect(types[0].Requirements.Get(corev1.LabelTopologyRegion).Values()).To(Equal([]string{"eastus2"}))
+		return types[0].Requirements.Get(corev1.LabelTopologyRegion).Values()
 	}
-	g.Expect(remote.Quota.(*testQuota).calls).To(Equal(1), "failed regional refresh is backed off")
-	g.Expect(home.Quota.(*testQuota).calls).To(Equal(1))
-	onlyRemote := testClass()
-	onlyRemote.Spec.Regions = onlyRemote.Spec.Regions[1:]
-	_, err := provider.List(ctx, onlyRemote)
-	g.Expect(err).To(MatchError(ContainSubstring("westus2 quota")))
+	g.Expect(listedRegions()).To(ConsistOf("eastus2", "westus2"))
+	remoteTypes.updateErr = errors.New("SKU API unavailable")
+	remoteQuota.err = errors.New("quota API unavailable")
+	clk.Step(quotaRefreshInterval)
+	g.Expect(listedRegions()).To(ConsistOf("eastus2", "westus2"))
+	g.Expect(remoteQuota.calls).To(Equal(2))
+	g.Expect(remoteQuota.resets).To(BeZero(), "quota younger than the staleness limit is still served")
+	clk.Step(quotaMaxStaleness - quotaRefreshInterval)
+	g.Expect(listedRegions()).To(ConsistOf("eastus2", "westus2"))
+	g.Expect(remoteQuota.resets).To(Equal(1), "stale quota fails open like the home region")
+	clk.Step(skuRefreshInterval)
+	g.Expect(listedRegions()).To(ConsistOf("eastus2", "westus2"), "a failed SKU refresh keeps the last successful catalog")
+	g.Expect(remoteTypes.updates).To(Equal(2))
+	g.Expect(home.Quota.(*testQuota).calls).To(BeZero())
 }
 
 func TestConcurrentRegionalHydration(t *testing.T) {

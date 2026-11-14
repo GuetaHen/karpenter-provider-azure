@@ -188,7 +188,7 @@ type AKSNodeClassSpec struct {
 	// +listType=map
 	// +listMapKey=name
 	// +optional
-	Regions []Region `json:"regions,omitempty"`
+	Regions []Region `json:"regions,omitempty" hash:"ignore"` // Placement drift is evaluated per NodeClaim, so editing regions only replaces nodes whose region or subnet is removed.
 	// vnetSubnetID is the subnet used by nics provisioned with this nodeclass.
 	// If not specified, we will use the default --vnet-subnet-id specified in karpenter's options config
 	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
@@ -1028,7 +1028,6 @@ const AKSNodeClassHashVersion = "v3"
 
 func (in *AKSNodeClass) Hash() string {
 	spec := in.Spec.DeepCopy()
-	spec.Regions = normalizeRegionsForHash(spec.Regions)
 	if spec.CapacityReservation != nil {
 		spec.CapacityReservation.GroupID = lo.ToPtr(strings.ToLower(lo.FromPtr(spec.CapacityReservation.GroupID)))
 	}
@@ -1067,16 +1066,6 @@ func (in *AKSNodeClass) Hash() string {
 		IgnoreZeroValue: true,
 		ZeroNil:         true,
 	})))
-}
-
-func normalizeRegionsForHash(regions []Region) []Region {
-	if len(regions) == 0 {
-		return nil
-	}
-	for i := range regions {
-		regions[i].VNETSubnetID = strings.ToLower(regions[i].VNETSubnetID)
-	}
-	return regions
 }
 
 // AKSNodeClassList contains a list of AKSNodeClass

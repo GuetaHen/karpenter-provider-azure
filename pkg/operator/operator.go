@@ -302,48 +302,60 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		quotaProvider,
 	)
 
-	regionalNetworkValidator := sync.OnceValues(func() (*regional.NetworkValidator, error) {
-		virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
-		if err != nil {
-			return nil, fmt.Errorf("creating regional VNet client: %w", err)
-		}
-		return &regional.NetworkValidator{
-			SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
-		}, nil
-	})
-	regions := regional.New(azConfig.Location, &regional.Providers{
-		Types: instanceTypeProvider, Images: imageProvider, Instances: vmInstanceProvider, Quota: quotaProvider,
-	}, func(location string) *regional.Providers {
-		// Region-scoped providers own independent caches. Subscription-scoped ARM
-		// clients are shared; no mutable operator options are changed for a launch.
-		unavailable := azurecache.NewUnavailableOfferings()
-		prices := pricing.NewProvider(ctx, env, pricing.NewAPI(env.Cloud), location, operator.Elected())
-		quotas := quota.NewProvider(azClient.UsageClient, azClient.QuotaCategoryVMFamilyMappingClient, location, operator.Clock)
-		types := instancetype.NewDefaultProvider(location,
-			cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
-			azClient.SKUClient, prices, unavailable, quotas)
-		images := imagefamily.NewProvider(azClient.ImageVersionsClient, location, azConfig.SubscriptionID,
-			azClient.NodeImageVersionsClient, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
-		resolver := imagefamily.NewDefaultResolver(operator.GetClient(), images, types, azClient.NodeBootstrappingClient)
-		templates := launchtemplate.NewProvider(ctx, resolver, images, networkSecurityGroupProvider,
-			lo.Must(getCABundle(operator.GetConfig())), options.FromContext(ctx).ClusterEndpoint,
-			azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientID,
-			options.FromContext(ctx).NodeResourceGroup, location, options.FromContext(ctx).ProvisionMode)
-		// Cross-region selection uses the existing price/capacity ranker, not
-		// a home-region placement-score request or fabricated regional prices.
-		allocator := allocationstrategy.NewProvider(nil, consts.ComputeRecommendationModeDisabled)
-		instances := instance.NewDefaultVMProvider(azClient, types, allocator, templates,
-			loadBalancerProvider, networkSecurityGroupProvider, unavailable, location,
-			options.FromContext(ctx).NodeResourceGroup, azConfig.SubscriptionID, options.FromContext(ctx).ProvisionMode,
-			options.FromContext(ctx).DiskEncryptionSetID, env, quotas)
-		return &regional.Providers{Types: types, Images: images, Instances: instances, Quota: quotas}
-	}, func(ctx context.Context, region v1beta1.Region) error {
-		validator, err := regionalNetworkValidator()
-		if err != nil {
-			return err
-		}
-		return validator.Validate(ctx, region)
-	})
+	// Multi-region provisioning is opt-in. When it is disabled, no regional registry,
+	// wrapper, ARM client or cache is constructed and the home-region providers are used
+	// directly, exactly as before the feature existed.
+	var regions *regional.Registry
+	var wrappedImages imagefamily.NodeImageProvider = imageProvider
+	var wrappedTypes instancetype.Provider = instanceTypeProvider
+	var wrappedVMs instance.VMProvider = vmInstanceProvider
+	if options.FromContext(ctx).EnableMultiRegion {
+		regionalNetworkValidator := sync.OnceValues(func() (*regional.NetworkValidator, error) {
+			virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
+			if err != nil {
+				return nil, fmt.Errorf("creating regional VNet client: %w", err)
+			}
+			return &regional.NetworkValidator{
+				SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
+			}, nil
+		})
+		regions = regional.New(azConfig.Location, &regional.Providers{
+			Types: instanceTypeProvider, Images: imageProvider, Instances: vmInstanceProvider, Quota: quotaProvider,
+		}, func(location string) *regional.Providers {
+			// Region-scoped providers own independent caches. Subscription-scoped ARM
+			// clients are shared; no mutable operator options are changed for a launch.
+			unavailable := azurecache.NewUnavailableOfferings()
+			prices := pricing.NewProvider(ctx, env, pricing.NewAPI(env.Cloud), location, operator.Elected())
+			quotas := quota.NewProvider(azClient.UsageClient, azClient.QuotaCategoryVMFamilyMappingClient, location, operator.Clock)
+			types := instancetype.NewDefaultProvider(location,
+				cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
+				azClient.SKUClient, prices, unavailable, quotas)
+			images := imagefamily.NewProvider(azClient.ImageVersionsClient, location, azConfig.SubscriptionID,
+				azClient.NodeImageVersionsClient, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
+			resolver := imagefamily.NewDefaultResolver(operator.GetClient(), images, types, azClient.NodeBootstrappingClient)
+			templates := launchtemplate.NewProvider(ctx, resolver, images, networkSecurityGroupProvider,
+				lo.Must(getCABundle(operator.GetConfig())), options.FromContext(ctx).ClusterEndpoint,
+				azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientID,
+				options.FromContext(ctx).NodeResourceGroup, location, options.FromContext(ctx).ProvisionMode)
+			// Cross-region selection uses the existing price/capacity ranker, not
+			// a home-region placement-score request or fabricated regional prices.
+			allocator := allocationstrategy.NewProvider(nil, consts.ComputeRecommendationModeDisabled)
+			instances := instance.NewDefaultVMProvider(azClient, types, allocator, templates,
+				loadBalancerProvider, networkSecurityGroupProvider, unavailable, location,
+				options.FromContext(ctx).NodeResourceGroup, azConfig.SubscriptionID, options.FromContext(ctx).ProvisionMode,
+				options.FromContext(ctx).DiskEncryptionSetID, env, quotas)
+			return &regional.Providers{Types: types, Images: images, Instances: instances, Quota: quotas}
+		}, func(ctx context.Context, region v1beta1.Region) error {
+			validator, err := regionalNetworkValidator()
+			if err != nil {
+				return err
+			}
+			return validator.Validate(ctx, region)
+		}).WithClock(operator.Clock)
+		wrappedImages = &regional.Images{NodeImageProvider: imageProvider, Registry: regions}
+		wrappedTypes = &regional.InstanceTypes{Provider: instanceTypeProvider, Registry: regions}
+		wrappedVMs = &regional.Instances{VMProvider: vmInstanceProvider, Registry: regions, KubeClient: operator.GetClient()}
+	}
 
 	return ctx, &Operator{
 		Operator:                     operator,
@@ -351,12 +363,12 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		ManagedDynamicInterface:      managedDynamicClient,
 		UnavailableOfferingsCache:    unavailableOfferingsCache,
 		KubernetesVersionProvider:    kubernetesVersionProvider,
-		ImageProvider:                &regional.Images{NodeImageProvider: imageProvider, Registry: regions},
+		ImageProvider:                wrappedImages,
 		ImageResolver:                imageResolver,
 		LaunchTemplateProvider:       launchTemplateProvider,
 		PricingProvider:              pricingProvider,
-		InstanceTypesProvider:        &regional.InstanceTypes{Provider: instanceTypeProvider, Registry: regions},
-		VMInstanceProvider:           &regional.Instances{VMProvider: vmInstanceProvider, Registry: regions, KubeClient: operator.GetClient()},
+		InstanceTypesProvider:        wrappedTypes,
+		VMInstanceProvider:           wrappedVMs,
 		RegionalProviders:            regions,
 		AKSMachineProvider:           aksMachineInstanceProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
@@ -366,6 +378,15 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		Location:                     azConfig.Location,
 		Cloud:                        env.Cloud,
 	}
+}
+
+// RegionalSubnetValidator returns nil when multi-region provisioning is disabled, so the
+// subnet status reconciler reports regional NodeClasses as disabled instead of validating them.
+func (op *Operator) RegionalSubnetValidator() func(context.Context, *v1beta1.AKSNodeClass) error {
+	if op.RegionalProviders == nil {
+		return nil
+	}
+	return op.RegionalProviders.ValidateSubnets
 }
 
 func GetAZConfig() (*auth.Config, error) {

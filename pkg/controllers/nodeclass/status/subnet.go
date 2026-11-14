@@ -65,7 +65,7 @@ const (
 func (r *SubnetReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	if len(nodeClass.Spec.Regions) > 0 {
 		if r.validateRegions == nil {
-			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "MultiRegionUnavailable", "regional subnet validation is not configured")
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "MultiRegionDisabled", "spec.regions requires the controller option --enable-multi-region (ENABLE_MULTI_REGION=true)")
 			return reconcile.Result{}, nil
 		}
 		if err := r.validateRegions(ctx, nodeClass); err != nil {

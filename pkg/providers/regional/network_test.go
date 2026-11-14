@@ -20,11 +20,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/azclient/azapi"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	clocktesting "k8s.io/utils/clock/testing"
 )
 
 type testNetworks struct {
@@ -40,9 +42,11 @@ type testSubnets struct {
 	azapi.SubnetsAPI
 	properties *armnetwork.SubnetPropertiesFormat
 	err        error
+	calls      int
 }
 
 func (p *testSubnets) Get(context.Context, string, string, string, *armnetwork.SubnetsClientGetOptions) (armnetwork.SubnetsClientGetResponse, error) {
+	p.calls++
 	return armnetwork.SubnetsClientGetResponse{Subnet: armnetwork.Subnet{Properties: p.properties}}, p.err
 }
 
@@ -72,4 +76,22 @@ func TestRegionalNetworkValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRegionalNetworkValidationIsReusedBriefly(t *testing.T) {
+	g := NewWithT(t)
+	clk := clocktesting.NewFakeClock(time.Now())
+	subnets := &testSubnets{properties: &armnetwork.SubnetPropertiesFormat{NetworkSecurityGroup: &armnetwork.SecurityGroup{ID: lo.ToPtr("/synthetic/nsg")}}}
+	v := &NetworkValidator{SubscriptionID: "00000000-0000-0000-0000-000000000001", VirtualNetworks: &testNetworks{location: "eastus2"}, Subnets: subnets, Clock: clk}
+	region := testClass().Spec.Regions[0]
+	for range 3 {
+		g.Expect(v.Validate(t.Context(), region)).To(Succeed())
+	}
+	g.Expect(subnets.calls).To(Equal(1), "launch bursts share one successful check")
+	clk.Step(validationTTL)
+	subnets.properties = &armnetwork.SubnetPropertiesFormat{}
+	for range 2 {
+		g.Expect(v.Validate(t.Context(), region)).To(MatchError(ContainSubstring("network security group")))
+	}
+	g.Expect(subnets.calls).To(Equal(3), "expired successes are re-checked and failures are never cached")
 }

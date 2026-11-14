@@ -128,24 +128,17 @@ var _ = Describe("Hash", func() {
 		Entry("NodePublicIP.Enabled", v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{NodePublicIP: &v1beta1.NodePublicIP{Enabled: lo.ToPtr(true)}}}),
 	)
 	Context("Regions", func() {
-		It("should hash regional configuration without drifting pre-feature objects or mutating input", func() {
-			originalHash := nodeClass.Hash()
-			Expect(originalHash).To(Equal(staticHash))
-			nodeClass.Spec.Regions = []v1beta1.Region{
-				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
-				{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+		It("should exclude regions so that only placement drift replaces regional nodes", func() {
+			Expect(nodeClass.Hash()).To(Equal(staticHash))
+			east := v1beta1.Region{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}
+			west := v1beta1.Region{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}
+			changed := v1beta1.Region{Name: west.Name, VNETSubnetID: strings.ToUpper(west.VNETSubnetID) + "-new"}
+			for _, regions := range [][]v1beta1.Region{{east}, {east, west}, {west, east}, {west}, {changed}, {}, nil} {
+				nodeClass.Spec.Regions = regions
+				original := nodeClass.DeepCopy()
+				Expect(nodeClass.Hash()).To(Equal(staticHash), "add, reorder, remove and subnet changes are placement changes")
+				Expect(nodeClass).To(Equal(original), "hashing must not mutate the NodeClass")
 			}
-			original := nodeClass.DeepCopy()
-			hash := nodeClass.Hash()
-			Expect(hash).ToNot(Equal(originalHash))
-			Expect(nodeClass).To(Equal(original))
-			nodeClass.Spec.Regions[0], nodeClass.Spec.Regions[1] = nodeClass.Spec.Regions[1], nodeClass.Spec.Regions[0]
-			nodeClass.Spec.Regions[0].VNETSubnetID = strings.ToUpper(nodeClass.Spec.Regions[0].VNETSubnetID)
-			Expect(nodeClass.Hash()).To(Equal(hash))
-			nodeClass.Spec.Regions[0].VNETSubnetID += "-new"
-			Expect(nodeClass.Hash()).ToNot(Equal(hash))
-			nodeClass.Spec.Regions = nil
-			Expect(nodeClass.Hash()).To(Equal(originalHash))
 		})
 	})
 	Context("NodePublicIP", func() {
