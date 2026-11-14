@@ -38,9 +38,9 @@ func TestInconsistentSKUExcludesOnlyThatRegionsOfferings(t *testing.T) {
 	g := NewWithT(t)
 	ctx := testContext(t)
 	home, remote := testProviders("eastus2", .4), testProviders("westus2", .2)
-	inconsistent := testType("westus2", .2, true)
+	inconsistent := testType("westus2", .2)
 	inconsistent.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")}
-	remote.Types.(*testTypes).types = []*cloudprovider.InstanceType{inconsistent, renamed(testType("westus2", .3, true), "Standard_D4s_v5")}
+	remote.Types.(*testTypes).types = []*cloudprovider.InstanceType{inconsistent, renamed(testType("westus2", .3), "Standard_D4s_v5")}
 	excluded := InconsistentOfferingsMetric.WithLabelValues("westus2", "Standard_D2s_v5", "capacity")
 	before := testutil.ToFloat64(excluded)
 	provider := &InstanceTypes{Provider: home.Types, Registry: New("eastus2", home, func(string) *Providers { return remote }, nil)}
@@ -54,7 +54,7 @@ func TestInconsistentSKUExcludesOnlyThatRegionsOfferings(t *testing.T) {
 	g.Expect(types[1].Offerings[0].Requirements.Get(corev1.LabelTopologyRegion).Values()).To(Equal([]string{"westus2"}))
 	g.Expect(testutil.ToFloat64(excluded) - before).To(Equal(1.0))
 
-	equivalent := testType("westus2", .2, true)
+	equivalent := testType("westus2", .2)
 	equivalent.Capacity = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2000m")}
 	remote.Types.(*testTypes).types = []*cloudprovider.InstanceType{equivalent}
 	types, err = provider.List(ctx, testClass())
@@ -76,7 +76,7 @@ func TestMergedCatalogIsReusedUntilARegionChanges(t *testing.T) {
 	second, err := provider.List(ctx, testClass())
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(second[0]).To(BeIdenticalTo(merged), "unchanged regional results reuse the merged catalog, and each caller gets its own slice")
-	remote.Types.(*testTypes).types = []*cloudprovider.InstanceType{testType("westus2", .1, true)}
+	remote.Types.(*testTypes).types = []*cloudprovider.InstanceType{testType("westus2", .1)}
 	refreshed, err := provider.List(ctx, testClass())
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(refreshed[0]).ToNot(BeIdenticalTo(merged), "new regional results rebuild the catalog")

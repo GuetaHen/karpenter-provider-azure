@@ -115,7 +115,7 @@ func testContext(t *testing.T) context.Context {
 	return options.ToContext(t.Context(), &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone, EnableMultiRegion: true})
 }
 
-func testType(region string, price float64, available bool) *cloudprovider.InstanceType {
+func testType(region string, price float64) *cloudprovider.InstanceType {
 	return &cloudprovider.InstanceType{
 		Name:     "Standard_D2s_v5",
 		Capacity: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")},
@@ -129,7 +129,7 @@ func testType(region string, price float64, available bool) *cloudprovider.Insta
 			scheduling.NewRequirement(v1beta1.LabelUltraSSD, corev1.NodeSelectorOpIn, "false"),
 		),
 		Offerings: cloudprovider.Offerings{{
-			Available: available, Price: price,
+			Available: true, Price: price,
 			Requirements: scheduling.NewRequirements(
 				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "0"),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
@@ -142,7 +142,7 @@ func testType(region string, price float64, available bool) *cloudprovider.Insta
 
 func testProviders(region string, price float64) *Providers {
 	return &Providers{
-		Types:     &testTypes{types: []*cloudprovider.InstanceType{testType(region, price, true)}},
+		Types:     &testTypes{types: []*cloudprovider.InstanceType{testType(region, price)}},
 		Quota:     &testQuota{},
 		Images:    &testImages{images: []imagefamily.NodeImage{{ID: "gallery/image/versions/1", Requirements: scheduling.NewRequirements()}}},
 		Instances: &testVMs{},
