@@ -563,7 +563,10 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 		})
 
 		Context("with --community-gallery-fips-images", func() {
-			const fipsVersion = "202610.30.1"
+			const (
+				fipsVersion      = "202610.30.1"
+				newerFIPSVersion = "202611.06.0"
+			)
 			fipsDefinitions := func() []string {
 				family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, testK8sVersion, nil)
 				defaultImages := family.DefaultImages(true, nodeClass.Spec.FIPSMode, false, false)
@@ -573,10 +576,38 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 				}
 				return names
 			}
-			fipsImageIDs := func() []string {
+			fipsImageIDs := func(version string) []string {
 				return lo.Map(fipsDefinitions(), func(name string, _ int) string {
-					return imagefamily.BuildImageIDCIG(imagefamily.AKSAzureLinuxPublicGalleryURL, name, fipsVersion)
+					return imagefamily.BuildImageIDCIG(imagefamily.AKSAzureLinuxPublicGalleryURL, name, version)
 				})
+			}
+			statusImageIDs := func() []string {
+				return lo.Map(nodeClass.Status.Images, func(image v1beta1.NodeImage, _ int) string { return image.ID })
+			}
+			// closedWindowReconciler reconciles images while the node OS maintenance window is closed.
+			closedWindowReconciler := func() *status.NodeImageReconciler {
+				kube := kubernetesfake.NewClientset(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
+					Data: map[string]string{
+						"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339),
+						"aksManagedNodeOSUpgradeSchedule-end":   time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+					},
+				})
+				return status.NewNodeImageReconciler(azureEnv.ImageProvider, kube, "kube-system")
+			}
+			// withoutFIPSImages makes the region list no FIPS image.
+			withoutFIPSImages := func() {
+				azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()
+				azureEnv.NodeImagesCache.Flush()
+			}
+			// withNewerFIPSImages makes the region list its FIPS images again, at a version published after fipsVersion.
+			withNewerFIPSImages := func() {
+				azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = nil
+				azureEnv.CommunityImageVersionsAPI.ImageVersions.Append(&armcompute.CommunityGalleryImageVersion{
+					Name:       lo.ToPtr(newerFIPSVersion),
+					Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC))},
+				})
+				azureEnv.NodeImagesCache.Flush()
 			}
 
 			BeforeEach(func() {
@@ -601,7 +632,7 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 				_, err := imageReconciler.Reconcile(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
-				Expect(lo.Map(nodeClass.Status.Images, func(image v1beta1.NodeImage, _ int) string { return image.ID })).To(ConsistOf(fipsImageIDs()))
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(fipsVersion)))
 			})
 
 			It("reports an image family without community gallery FIPS images", func() {
@@ -614,10 +645,11 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 				Expect(nodeClass.Status.Images).To(BeNil())
 			})
 
-			It("names the region without a FIPS image and keeps the resolved images", func() {
+			It("names the region without a FIPS image and keeps the ready images", func() {
 				azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()
-				resolved := []v1beta1.NodeImage{{ID: fipsImageIDs()[0]}}
+				resolved := []v1beta1.NodeImage{{ID: fipsImageIDs(fipsVersion)[0]}}
 				nodeClass.Status.Images = resolved
+				nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 				result, err := imageReconciler.Reconcile(ctx, nodeClass)
 				Expect(err).ToNot(HaveOccurred())
 				Expect(result.RequeueAfter).ToNot(BeZero())
@@ -626,6 +658,46 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 				Expect(condition.Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
 				Expect(condition.Message).To(ContainSubstring("region " + fake.Region))
 				Expect(nodeClass.Status.Images).To(Equal(resolved))
+			})
+
+			It("keeps the image versions in use when the FIPS images return while the maintenance window is closed", func() {
+				reconciler := closedWindowReconciler()
+				_, err := reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(fipsVersion)))
+				inUse := nodeClass.DeepCopy().Status.Images
+
+				withoutFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+				Expect(nodeClass.Status.Images).To(Equal(inUse))
+
+				withNewerFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+				Expect(nodeClass.Status.Images).To(Equal(inUse))
+			})
+
+			It("completes a pending image update when the FIPS images return", func() {
+				reconciler := closedWindowReconciler()
+				_, err := reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+
+				// A Kubernetes upgrade requests the newest images while the region lists no FIPS image.
+				nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "KubernetesUpgrade", "Performing kubernetes upgrade, need to get latest images")
+				withoutFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+				Expect(nodeClass.Status.Images).To(BeEmpty())
+
+				withNewerFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(newerFIPSVersion)))
 			})
 		})
 	})

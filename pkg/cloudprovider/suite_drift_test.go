@@ -36,7 +36,6 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
-	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 )
@@ -185,29 +184,6 @@ var _ = Describe("CloudProvider", func() {
 					drifted, err := cloudProvider.IsDrifted(ctx, driftNodeClaim)
 					Expect(err).ToNot(HaveOccurred())
 					Expect(drifted).To(Equal(ImageDrift))
-				})
-
-				It("should trigger drift for an older community gallery FIPS image version", func() {
-					fipsImageID := func(version string) string {
-						return imagefamily.BuildImageIDCIG(imagefamily.AKSAzureLinuxPublicGalleryURL, imagefamily.AzureLinux3Gen2FIPSImageDefinition, version)
-					}
-					nodeClass = ExpectExists(ctx, env.Client, nodeClass)
-					nodeClass.Status.Images = []v1beta1.NodeImage{{
-						ID: fipsImageID("202610.30.1"),
-						Requirements: []v1.NodeSelectorRequirement{
-							{Key: v1.LabelArchStable, Operator: v1.NodeSelectorOpIn, Values: []string{karpv1.ArchitectureAmd64}},
-							{Key: v1beta1.LabelSKUHyperVGeneration, Operator: v1.NodeSelectorOpIn, Values: []string{v1beta1.HyperVGenerationV2}},
-						},
-					}}
-					ExpectApplied(ctx, env.Client, nodeClass)
-					driftNodeClaim.Status.ImageID = fipsImageID("202610.23.0")
-					drifted, err := cloudProvider.IsDrifted(ctx, driftNodeClaim)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(drifted).To(Equal(ImageDrift))
-					driftNodeClaim.Status.ImageID = fipsImageID("202610.30.1")
-					drifted, err = cloudProvider.IsDrifted(ctx, driftNodeClaim)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(drifted).To(Equal(NoDrift))
 				})
 			})
 

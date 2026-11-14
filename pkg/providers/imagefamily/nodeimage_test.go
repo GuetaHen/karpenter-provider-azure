@@ -101,6 +101,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 		communityImageVersionsAPI *fake.CommunityGalleryImageVersionsAPI
 
 		nodeImageProvider imagefamily.NodeImageProvider
+		nodeImagesCache   *cache.Cache
 		nodeClass         *v1beta1.AKSNodeClass
 		kubernetesVersion string
 	)
@@ -114,7 +115,8 @@ var _ = Describe("NodeImageProvider tests", func() {
 		cigImageVersionTest := cigImageVersion
 		communityImageVersionsAPI.ImageVersions.Append(&armcompute.CommunityGalleryImageVersion{Name: &cigImageVersionTest})
 		nodeImageVersionsAPI := &fake.NodeImageVersionsAPI{}
-		nodeImageProvider = imagefamily.NewProvider(communityImageVersionsAPI, fake.Region, customerSubscription, nodeImageVersionsAPI, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval))
+		nodeImagesCache = cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval)
+		nodeImageProvider = imagefamily.NewProvider(communityImageVersionsAPI, fake.Region, customerSubscription, nodeImageVersionsAPI, nodeImagesCache)
 		kubernetesVersion = lo.Must(env.KubernetesInterface.Discovery().ServerVersion()).String()
 
 		nodeClass = test.AKSNodeClass(test.WithVersionBasedDefaults(env.Version))
@@ -148,6 +150,12 @@ var _ = Describe("NodeImageProvider tests", func() {
 			}
 			return names
 		}
+		// cacheExpiration returns when the only cached listing expires.
+		cacheExpiration := func() time.Time {
+			items := lo.Values(nodeImagesCache.Items())
+			Expect(items).To(HaveLen(1))
+			return time.Unix(0, items[0].Expiration)
+		}
 
 		BeforeEach(func() {
 			testOptions.CommunityGalleryFIPSImages = true
@@ -166,6 +174,7 @@ var _ = Describe("NodeImageProvider tests", func() {
 			for _, image := range images {
 				Expect(strings.ToLower(image.ID)).To(ContainSubstring("fips"))
 			}
+			Expect(cacheExpiration()).To(BeTemporally(">", time.Now().Add(imagefamily.ImageExpirationInterval-time.Hour)))
 		})
 
 		It("never selects a placeholder or excluded version, even a newer one", func() {
@@ -174,10 +183,22 @@ var _ = Describe("NodeImageProvider tests", func() {
 			Expect(nodeImageProvider.List(ctx, nodeClass)).To(Equal(expectedImages(laterCIGImageVersion)))
 		})
 
-		It("skips an image definition that the region does not publish", func() {
+		DescribeTable("selects the version published last, whatever its version number",
+			func(publishedLast, publishedFirst string) {
+				communityImageVersionsAPI.ImageVersions.Reset()
+				communityImageVersionsAPI.ImageVersions.Append(communityVersion(publishedFirst, 2*time.Hour, false))
+				communityImageVersionsAPI.ImageVersions.Append(communityVersion(publishedLast, time.Hour, false))
+				Expect(nodeImageProvider.List(ctx, nodeClass)).To(Equal(expectedImages(publishedLast)))
+			},
+			Entry("a lower version published after a higher one", "202610.9.0", "202610.30.1"),
+			Entry("a higher version published after a lower one", "202610.30.1", "202610.9.0"),
+		)
+
+		It("skips an image definition that the region does not publish and caches that listing briefly", func() {
 			missing := definitions()[0]
 			communityImageVersionsAPI.NotFoundImageDefinitions = []string{missing}
 			Expect(nodeImageProvider.List(ctx, nodeClass)).To(Equal(expectedImages(laterCIGImageVersion, missing)))
+			Expect(cacheExpiration()).To(BeTemporally("<=", time.Now().Add(imagefamily.PartialFIPSImageListExpiration)))
 		})
 
 		It("names the region without a usable FIPS image and never falls back to non-FIPS images", func() {

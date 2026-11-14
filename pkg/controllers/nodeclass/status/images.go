@@ -142,7 +142,12 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 
 	nodeImages, err := r.nodeImageProvider.List(ctx, nodeClass)
 	if notFound := new(imagefamily.FIPSImagesNotFoundError); stderrors.As(err, &notFound) {
-		// Launches stop until every region has a FIPS image. The resolved images stay, so nodes do not drift.
+		// Launches stop until every region has a FIPS image. Ready images stay, so nodes do not drift and the
+		// maintenance window still governs their update (see imageVersionsUnready). The images of a pending
+		// update, such as a new NodeClass or a Kubernetes upgrade, are dropped so that the update completes.
+		if imageVersionsUnready(nodeClass) {
+			nodeClass.Status.Images = nil
+		}
 		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, imagefamily.FIPSImagesNotFoundReason, notFound.Error())
 		return reconcile.Result{RequeueAfter: requeueTime}, nil
 	}
@@ -231,8 +236,15 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 // Handles case 1: This is a new AKSNodeClass, where images haven't been populated yet
 // Handles case 2: This is indirectly handling k8s version image bump, since k8s version sets this status to false
 // Handles case 3: Note: like k8s we would also indirectly handle node features that required an image version bump, but none required atm.
+//
+// A NodeClass that kept its ready images while a region had no FIPS image (FIPSImagesNotFound) is not unready, so
+// that the maintenance window still governs their update once every region has one again.
 func imageVersionsUnready(nodeClass *v1beta1.AKSNodeClass) bool {
-	return !nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsTrue()
+	condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady)
+	if condition.IsFalse() && condition.Reason == imagefamily.FIPSImagesNotFoundReason && len(nodeClass.Status.Images) > 0 {
+		return false
+	}
+	return !condition.IsTrue()
 }
 
 // Handles case 4: check if the maintenance window is open

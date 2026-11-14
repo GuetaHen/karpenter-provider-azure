@@ -39,6 +39,10 @@ const (
 	// CommunityGalleryFIPSImagesUnavailableReason is the ImagesReady reason when the image family of a
 	// FIPS NodeClass publishes no usable FIPS node image in the public community gallery.
 	CommunityGalleryFIPSImagesUnavailableReason = "CommunityGalleryFIPSImagesUnavailable"
+	// PartialFIPSImageListExpiration is how long a community gallery FIPS image listing that skipped an image
+	// definition is cached, instead of ImageExpirationInterval, so that a definition missing only briefly
+	// returns soon.
+	PartialFIPSImageListExpiration = 5 * time.Minute
 )
 
 // HasCommunityGalleryFIPSImages reports whether the image family of nodeClass publishes FIPS node images
@@ -79,7 +83,8 @@ func (e *FIPSImagesNotFoundError) Error() string {
 // listCommunityFIPS resolves FIPS node images from the public community gallery in p.location, each image
 // definition at its newest usable version. A definition without one is skipped, as listSIG skips one that
 // the node image versions API does not list, so instance types that only it serves cannot launch in this
-// region. A region without any of the definitions fails; there is no fallback to non-FIPS images.
+// region, and List caches the listing for PartialFIPSImageListExpiration only. A region without any of the
+// definitions fails; there is no fallback to non-FIPS images.
 func (p *provider) listCommunityFIPS(ctx context.Context, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
 	nodeImages := []NodeImage{}
 	var missing []string

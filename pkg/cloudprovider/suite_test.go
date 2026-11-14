@@ -735,6 +735,35 @@ var _ = Describe("CloudProvider", func() {
 					Expect(notFound.Location).To(Equal(fake.RegionNonZonal))
 					Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal)))
 				})
+				It("should drift a node that carries the FIPS image version of another region", func() {
+					images, err := regionalImages.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					nodeClass.Status.Images = lo.Map(images, func(image imagefamily.NodeImage, _ int) v1beta1.NodeImage {
+						return v1beta1.NodeImage{ID: image.ID, Requirements: lo.Map(image.Requirements.NodeSelectorRequirements(), func(r karpv1.NodeSelectorRequirementWithMinValues, _ int) v1.NodeSelectorRequirement {
+							return v1.NodeSelectorRequirement{Key: r.Key, Operator: r.Operator, Values: r.Values}
+						})}
+					})
+					ExpectApplied(ctx, env.Client, nodeClass)
+					current := ExpectExists(ctx, env.Client, nodeClass)
+					var drift corecloudprovider.DriftReason
+					for _, placement := range []struct{ region, own, other string }{
+						{fake.Region, "202610.23.0", "202610.30.1"},
+						{fake.RegionNonZonal, "202610.30.1", "202610.23.0"},
+					} {
+						nodeClaim.Labels[v1.LabelTopologyRegion] = placement.region
+						others := fipsImageIDs(placement.other)
+						for i, own := range fipsImageIDs(placement.own) {
+							nodeClaim.Status.ImageID = own
+							drift, err = cloudProvider.isImageVersionDrifted(ctx, nodeClaim, current)
+							Expect(err).ToNot(HaveOccurred())
+							Expect(drift).To(BeEmpty(), "%s in %s", own, placement.region)
+							nodeClaim.Status.ImageID = others[i]
+							drift, err = cloudProvider.isImageVersionDrifted(ctx, nodeClaim, current)
+							Expect(err).ToNot(HaveOccurred())
+							Expect(drift).To(Equal(ImageDrift), "%s in %s", others[i], placement.region)
+						}
+					}
+				})
 			})
 			It("should keep a hydrated region when its refresh fails and fail stale quota open", func() {
 				start := fakeClock.Now()

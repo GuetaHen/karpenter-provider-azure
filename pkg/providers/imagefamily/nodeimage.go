@@ -112,7 +112,12 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 	if err != nil {
 		return []NodeImage{}, err
 	}
-	p.nodeImagesCache.Set(key, nodeImages, cache.DefaultExpiration)
+	expiration := cache.DefaultExpiration
+	if communityFIPS && len(nodeImages) < len(supportedImages) {
+		// An image definition was skipped; list again soon in case it was missing only briefly.
+		expiration = PartialFIPSImageListExpiration
+	}
+	p.nodeImagesCache.Set(key, nodeImages, expiration)
 
 	return nodeImages, nil
 }

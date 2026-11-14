@@ -225,10 +225,16 @@ community images are resolved:
 - A definition that a region does not publish is skipped there, so instance
   types that only it serves (for example arm64) cannot launch in that region;
   restrict `kubernetes.io/arch` and `karpenter.azure.com/sku-hyperv-generation`
-  in the NodePool if that matters. A region with none of the definitions sets
-  `ImagesReady=False` with reason `FIPSImagesNotFound` and a message that names
-  the region. The images resolved before are kept, so existing nodes do not
-  drift.
+  in the NodePool if that matters. A listing that skipped a definition is
+  cached for five minutes instead of three days. While a definition is skipped,
+  nodes in that region that run its image count as drifted, and it returns at
+  its newest version.
+- A region with none of the definitions sets `ImagesReady=False` with reason
+  `FIPSImagesNotFound` and a message that names the region. Ready images are
+  kept, so existing nodes do not drift, and once every region lists its FIPS
+  images again the maintenance window still governs their update. The images of
+  a pending update (a new NodeClass, a Kubernetes upgrade) are dropped instead,
+  so that the update completes then.
 - Other image families report reason `CommunityGalleryFIPSImagesUnavailable`:
   the Ubuntu community gallery lists a FIPS definition whose only version is a
   placeholder.
