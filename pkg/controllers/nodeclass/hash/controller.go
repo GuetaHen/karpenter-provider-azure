@@ -33,6 +33,7 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
 )
 
 type Controller struct {
@@ -95,6 +96,10 @@ func (c *Controller) updateNodeClaimHash(ctx context.Context, nodeClass *v1beta1
 	errs := make([]error, len(ncList.Items))
 	for i := range ncList.Items {
 		nc := ncList.Items[i]
+		// The name index also matches NodeClaims of another controller's node class.
+		if nodeclaimutils.IsForeignNodeClassRef(nc.Spec.NodeClassRef) {
+			continue
+		}
 		stored := nc.DeepCopy()
 
 		if nc.Annotations[v1beta1.AnnotationAKSNodeClassHashVersion] != v1beta1.AKSNodeClassHashVersion {

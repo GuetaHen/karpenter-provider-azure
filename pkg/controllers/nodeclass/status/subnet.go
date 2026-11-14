@@ -33,6 +33,12 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
+// reasonedError carries its own status condition reason.
+type reasonedError interface {
+	error
+	Reason() string
+}
+
 type SubnetReconciler struct {
 	subnetClient    azapi.SubnetsAPI
 	validateRegions func(context.Context, *v1beta1.AKSNodeClass) error
@@ -69,7 +75,11 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKS
 			return reconcile.Result{}, nil
 		}
 		if err := r.validateRegions(ctx, nodeClass); err != nil {
-			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, "RegionalSubnetInvalid", err.Error())
+			reason := "RegionalSubnetInvalid"
+			if reasoned, ok := lo.ErrorsAs[reasonedError](err); ok {
+				reason = reasoned.Reason()
+			}
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, reason, err.Error())
 			return reconcile.Result{}, err
 		}
 		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)

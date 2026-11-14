@@ -206,11 +206,11 @@ func (c *CloudProvider) isImageVersionDrifted(
 // spec.regions. Regions are excluded from the NodeClass hash, so only NodeClaims whose
 // own region or subnet is no longer listed are replaced.
 func (c *CloudProvider) isRegionalPlacementDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (cloudprovider.DriftReason, error) {
-	reason := regional.PlacementDrift(nodeClass.Spec.Regions, nodeClaim.Annotations[regional.PlacementAnnotation])
+	cause, reason := regional.PlacementDriftCause(nodeClass.Spec.Regions, nodeClaim.Annotations[regional.PlacementAnnotation])
 	if reason == "" {
 		return NoDrift, nil
 	}
-	log.FromContext(ctx).V(1).Info("drift triggered by regional placement", "driftType", RegionalPlacementDrift, "reason", reason)
+	log.FromContext(ctx).V(1).Info("drift triggered by regional placement", "driftType", RegionalPlacementDrift, "cause", cause, "reason", reason)
 	return RegionalPlacementDrift, nil
 }
 
@@ -234,10 +234,12 @@ func (c *CloudProvider) isKubeletIdentityDrifted(ctx context.Context, nodeClaim 
 		return "", nil
 	}
 
-	if kubeletIdentityClientID != opts.KubeletIdentityClientID {
+	// MULTI_REGION_NODE_IDENTITIES can give the NodeClaim's region its own kubelet identity.
+	expectedKubeletIdentityClientID := opts.KubeletIdentityClientIDFor(nodeClaim.Labels[v1.LabelTopologyRegion])
+	if kubeletIdentityClientID != expectedKubeletIdentityClientID {
 		logger.V(1).Info("drift triggered due to expected and actual kubelet identity client id mismatch",
 			"driftType", KubeletIdentityDrift,
-			"expectedKubeletIdentityClientID", opts.KubeletIdentityClientID,
+			"expectedKubeletIdentityClientID", expectedKubeletIdentityClientID,
 			"actualKubeletIdentityClientID", kubeletIdentityClientID)
 		return KubeletIdentityDrift, nil
 	}

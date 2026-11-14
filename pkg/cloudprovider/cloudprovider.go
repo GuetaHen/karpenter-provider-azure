@@ -491,6 +491,12 @@ func (c *CloudProvider) LivenessProbe(req *http.Request) error {
 // GetInstanceTypes returns all available InstanceTypes
 // May return apimachinery.NotFoundError if NodeClass is not found.
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	// Core asks for the instance types of every NodePool when it refreshes pricing or validates
+	// NodeOverlays. In coexistence mode another controller's NodePool has none here, and
+	// resolving its node class under this API group would only report a false error.
+	if nodeclaimutils.IsForeignNodeClassRef(nodePool.Spec.Template.Spec.NodeClassRef) {
+		return nil, nil
+	}
 	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -524,7 +530,11 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	if err != nil {
 		return fmt.Errorf("getting VM name, %w", err)
 	}
-	return c.vmInstanceProvider.Delete(ctx, nodeClaim, vmName)
+	err = c.vmInstanceProvider.Delete(ctx, nodeClaim, vmName)
+	if instance.IsNotOwnedError(err) {
+		c.recorder.Publish(cloudproviderevents.NodeClaimVirtualMachineNotOwned(nodeClaim, err))
+	}
+	return err
 }
 
 // IsDrifted checks if the NodeClaim has drifted from our goal state.
@@ -540,6 +550,9 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 //     maps each pod update to a NodeClaim event. This means every time a pod (including a DaemonSet pod) is scheduled to the node
 //     we'll get called.
 func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
+	if nodeclaimutils.IsForeignNodeClassRef(nodeClaim.Spec.NodeClassRef) {
+		return "", nil
+	}
 	// Not needed when GetInstanceTypes removes nodepool dependency
 	nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]
 	if !ok {
@@ -676,7 +689,7 @@ func (c *CloudProvider) resolveNodeClassFromNodePool(ctx context.Context, nodePo
 	if !nodeClass.DeletionTimestamp.IsZero() {
 		// For the purposes of NodeClass CloudProvider resolution, we treat deleting NodeClasses as NotFound,
 		// but we return a different error message to be clearer to users
-		return nil, utils.NewTerminatingResourceError(schema.GroupResource{Group: apis.Group, Resource: "aksnodeclasses"}, nodeClass.Name)
+		return nil, utils.NewTerminatingResourceError(schema.GroupResource{Group: apis.APIGroup, Resource: "aksnodeclasses"}, nodeClass.Name)
 	}
 	return nodeClass, nil
 }

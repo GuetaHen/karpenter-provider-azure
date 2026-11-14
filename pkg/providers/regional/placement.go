@@ -61,23 +61,39 @@ func PlacementAllowed(regions []v1beta1.Region, placement v1beta1.Region) bool {
 // NodeClass hash, so adding, removing or reordering regions replaces only NodeClaims
 // whose own region or subnet is no longer listed.
 func PlacementDrift(regions []v1beta1.Region, raw string) string {
+	_, reason := PlacementDriftCause(regions, raw)
+	return reason
+}
+
+// Placement drift causes. They are logged so that an unreadable placement can be told apart
+// from a placement that is no longer listed.
+const (
+	PlacementCauseMissing        = "PlacementMissing"
+	PlacementCauseRegionsRemoved = "RegionsRemoved"
+	PlacementCauseUnreadable     = "PlacementUnreadable"
+	PlacementCauseUnlisted       = "PlacementUnlisted"
+)
+
+// PlacementDriftCause classifies and explains placement drift. Both results are "" when the
+// recorded placement still matches spec.regions.
+func PlacementDriftCause(regions []v1beta1.Region, raw string) (string, string) {
 	switch {
 	case raw == "" && len(regions) == 0:
-		return ""
+		return "", ""
 	case raw == "":
-		return "the NodeClass lists regions but the NodeClaim has no regional placement"
+		return PlacementCauseMissing, "the NodeClass lists regions but the NodeClaim has no regional placement"
 	case len(regions) == 0:
-		return "the NodeClaim has a regional placement but the NodeClass no longer lists regions"
+		return PlacementCauseRegionsRemoved, "the NodeClaim has a regional placement but the NodeClass no longer lists regions"
 	}
 	placement, err := DecodePlacement(raw)
 	if err != nil {
 		// An unreadable placement cannot be verified; replacement needs no manual repair.
-		return err.Error()
+		return PlacementCauseUnreadable, err.Error()
 	}
 	if PlacementAllowed(regions, placement) {
-		return ""
+		return "", ""
 	}
-	return fmt.Sprintf("region %s with subnet %s is no longer listed in spec.regions", placement.Name, placement.VNETSubnetID)
+	return PlacementCauseUnlisted, fmt.Sprintf("region %s with subnet %s is no longer listed in spec.regions", placement.Name, placement.VNETSubnetID)
 }
 
 // ImageMatchesRegion reports whether an image's requirements admit the region. Drift

@@ -88,8 +88,7 @@ func (c *AzureResourceGraphAPI) getResourceList(query string) []interface{} {
 	switch query {
 	case c.vmListQuery:
 		vmList := lo.Filter(c.loadVMObjects(), func(vm armcompute.VirtualMachine, _ int) bool {
-			return vm.Tags != nil && vm.Tags[launchtemplate.NodePoolTagKey] != nil &&
-				vm.Tags[launchtemplate.KarpenterAKSMachineNodeClaimTagKey] == nil
+			return listedByQuery(vm.Tags, false)
 		})
 		resourceList := lo.Map(vmList, func(vm armcompute.VirtualMachine, _ int) interface{} {
 			b, _ := json.Marshal(vm)
@@ -98,8 +97,7 @@ func (c *AzureResourceGraphAPI) getResourceList(query string) []interface{} {
 		return resourceList
 	case c.nicListQuery:
 		nicList := lo.Filter(c.loadNicObjects(), func(nic armnetwork.Interface, _ int) bool {
-			return nic.Tags != nil && nic.Tags[launchtemplate.NodePoolTagKey] != nil &&
-				nic.Tags[launchtemplate.KarpenterAKSMachineNodeClaimTagKey] == nil
+			return listedByQuery(nic.Tags, false)
 		})
 		resourceList := lo.Map(nicList, func(nic armnetwork.Interface, _ int) interface{} {
 			b, _ := json.Marshal(nic)
@@ -108,7 +106,7 @@ func (c *AzureResourceGraphAPI) getResourceList(query string) []interface{} {
 		return resourceList
 	case c.nicListQueryWithAKSMachines:
 		nicList := lo.Filter(c.loadNicObjects(), func(nic armnetwork.Interface, _ int) bool {
-			return nic.Tags != nil && nic.Tags[launchtemplate.NodePoolTagKey] != nil
+			return listedByQuery(nic.Tags, true)
 		})
 		resourceList := lo.Map(nicList, func(nic armnetwork.Interface, _ int) interface{} {
 			b, _ := json.Marshal(nic)
@@ -117,6 +115,13 @@ func (c *AzureResourceGraphAPI) getResourceList(query string) []interface{} {
 		return resourceList
 	}
 	return nil
+}
+
+// listedByQuery mirrors the tag clauses of the list queries: the node pool tag, the owner tag in
+// coexistence mode and, unless AKS machine resources are included, no AKS machine tag.
+func listedByQuery(tags map[string]*string, includeAKSMachineResources bool) bool {
+	return tags != nil && tags[launchtemplate.NodePoolTagKey] != nil && launchtemplate.IsOwned(tags) &&
+		(includeAKSMachineResources || tags[launchtemplate.KarpenterAKSMachineNodeClaimTagKey] == nil)
 }
 
 func (c *AzureResourceGraphAPI) loadVMObjects() (vmList []armcompute.VirtualMachine) {

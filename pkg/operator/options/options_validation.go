@@ -38,6 +38,8 @@ func (o *Options) Validate() error {
 		o.validateRequiredFields(),
 		o.validateVNETGUID(),
 		o.validateKubeletIdentityClientID(),
+		o.validateMultiRegionOptions(),
+		o.validateCoexistence(),
 		o.validateEndpoint(),
 		o.validateNetworkingOptions(),
 		o.validateVMMemoryOverheadPercent(),

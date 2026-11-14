@@ -19,6 +19,7 @@ package cloudprovider
 // TODO v1beta1 extra refactor into suite_test.go / cloudprovider_test.go
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -608,6 +609,71 @@ var _ = Describe("CloudProvider", func() {
 				}
 				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2), "retries must adopt the original VM")
 				Expect(azureEnv.LoadBalancersAPI.NewListPagerBehavior.CalledWithInput.Len()).To(BeZero())
+			})
+			It("should give regional VMs the identities and kubelet identity of their region", func() {
+				globalIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/global"
+				regionalIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/remote"
+				regionalClientID := "11111111-2222-3333-4444-555555555555"
+				testOptions.NodeIdentities = []string{globalIdentity}
+				testOptions.MultiRegionNodeIdentities = map[string]options.RegionalNodeIdentity{
+					fake.RegionNonZonal: {NodeIdentities: []string{regionalIdentity}, KubeletIdentityClientID: regionalClientID},
+				}
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+				created := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+				Expect(lo.FromPtr(created.Location)).To(Equal(fake.RegionNonZonal))
+				Expect(lo.Keys(created.Identity.UserAssignedIdentities)).To(ConsistOf(regionalIdentity), "the regional entry replaces the global identities")
+				customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(created.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(customData)).To(ContainSubstring(v1beta1.AKSLabelKubeletIdentityClientID + "=" + regionalClientID))
+				Expect(string(customData)).ToNot(ContainSubstring(testOptions.KubeletIdentityClientID))
+				Expect(string(customData)).ToNot(ContainSubstring("test-kubelet-identity-client-id"))
+
+				// A retried launch adopts the regional VM and attaches no global identity.
+				claims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, claims)).To(Succeed())
+				Expect(claims.Items).To(HaveLen(1))
+				retried, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, &claims.Items[0])
+				Expect(err).ToNot(HaveOccurred())
+				Expect(retried.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.RegionNonZonal))
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero(), "the retry adopts the existing VM")
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineUpdateBehavior.Calls()).To(BeZero(), "adoption attaches no identity")
+			})
+			It("should label regional nodes with their placement subnet and the cluster VNet GUID under the external pod network opt-in", func() {
+				testOptions.NetworkPlugin, testOptions.NetworkPluginMode = consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay
+				testOptions.NetworkDataplane = consts.NetworkDataplaneCilium
+				testOptions.MultiRegionExternalPodNetwork = true
+				// Overlay pod ranges are allocated in the cluster VNet, so a regional node pairs the cluster
+				// VNet GUID with the name of the subnet its NIC is in.
+				regionalSubnetID := fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/remote-vnet/subnets/remote-nodes", azureEnv.SubscriptionID)
+				nodeClass.Spec.Regions[1].VNETSubnetID = regionalSubnetID
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(input.VM.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				for _, label := range []string{
+					"kubernetes.azure.com/nodenetwork-vnetguid=" + testOptions.VnetGUID,
+					"kubernetes.azure.com/network-subnet=remote-nodes",
+					"kubernetes.azure.com/azure-cni-overlay=true",
+					"kubernetes.azure.com/podnetwork-type=overlay",
+					"kubernetes.azure.com/ebpf-dataplane=cilium",
+					v1.LabelNodeExcludeBalancers + "=true",
+				} {
+					Expect(string(customData)).To(ContainSubstring(label))
+				}
+				nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nic.Properties.NetworkSecurityGroup).To(BeNil())
+				for _, config := range nic.Properties.IPConfigurations {
+					Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
+					Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(regionalSubnetID))
+				}
 			})
 			It("should keep a hydrated region when its refresh fails and fail stale quota open", func() {
 				start := fakeClock.Now()

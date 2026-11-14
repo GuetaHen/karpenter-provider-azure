@@ -2,25 +2,33 @@
 
 This fork extends the existing `karpenter.azure.com/v1beta1` `AKSNodeClass`.
 One Karpenter controller and one NodePool can select real Azure locations.
+In [coexistence mode](#coexistence-mode), the controller serves the same API as
+`multiregion.io/v1beta1` and runs beside another Karpenter installation.
 It is a provider foundation for isolated testing, **not production-ready managed
 NAP support**. No live-cluster validation is implied by unit or acceptance tests.
 
 ## Supported boundary
 
-The implemented path requires `PROVISION_MODE=aksscriptless`,
-`NETWORK_PLUGIN=none`, and an explicitly empty `NETWORK_PLUGIN_MODE`. The
-bring-your-own CNI must already support pod, Service, DNS, policy, and node
-connectivity across the configured regions. Only Linux nodes are supported.
-Managed Azure CNI (including Overlay), both AKS Machine API dispatch modes, and
-the bootstrapping service path are rejected before Azure writes, even when a
-NodeClass has a stale Ready condition.
+The implemented path requires `PROVISION_MODE=aksscriptless` and one of two
+network setups:
+
+- `NETWORK_PLUGIN=none` and an explicitly empty `NETWORK_PLUGIN_MODE`. The
+  bring-your-own CNI must already support pod, Service, DNS, policy, and node
+  connectivity across the configured regions.
+- Azure CNI Overlay (`NETWORK_PLUGIN=azure`, `NETWORK_PLUGIN_MODE=overlay`) with
+  [`--multi-region-external-pod-network`](#azure-cni-overlay-with-an-external-pod-network),
+  where an agent outside this provider carries the pod traffic of regional nodes.
+
+Only Linux nodes are supported. Other managed Azure CNI configurations, both AKS
+Machine API dispatch modes, and the bootstrapping service path are rejected
+before Azure writes, even when a NodeClass has a stale Ready condition.
 
 AKS owns the managed controller image and the Machine API's placement behavior.
 Building the `ccp` variant does not grant the ability to replace managed NAP, add
 Machine API regional placement, or provide a managed pod-network dataplane.
-Testing this fork as the **one main managed NAP controller** requires an
-AKS-approved image/configuration deployment contract and a supported networking
-path. Do not run a second autoscaler alongside managed NAP as a substitute.
+To run this fork beside another Karpenter installation in the same cluster,
+such as AKS node auto-provisioning, use [coexistence mode](#coexistence-mode).
+Never run two controllers that serve the same `AKSNodeClass` API group.
 
 Bring an existing subnet in each selected physical region, in the controller's
 subscription. Each subnet needs its own regional NSG, outbound connectivity,
@@ -31,9 +39,10 @@ gateways, CNI agents, or network policies; these read-only checks cannot prove
 end-to-end network connectivity.
 
 All VMs/NICs stay in the existing node resource group with the existing
-deterministic names. Grant the controller the normal VM/NIC permissions there
-and read/join permissions on the regional networks. Resource-group location is
-not the VM's physical location.
+deterministic names. Grant the controller the normal VM/NIC permissions there,
+read/join permissions on the regional networks, and permission to assign every
+identity in `--multi-region-node-identities`. Resource-group location is not the
+VM's physical location.
 
 Disk encryption sets, capacity reservation groups, node public IPs, Windows,
 and node-image-version pinning are rejected with `spec.regions`. Disk/PV
@@ -113,7 +122,9 @@ spec:
 The normal Azure credentials, node identity, bootstrap token, API endpoint,
 DNS IP, default subnet, node resource group and cluster options are still
 required. The default subnet identifies the home cluster; it is not substituted
-for any `regions[].vnetSubnetID`.
+for any `regions[].vnetSubnetID`. In coexistence mode, use
+`apiVersion: multiregion.io/v1beta1` for the `AKSNodeClass` and
+`group: multiregion.io` in each `nodeClassRef`.
 
 ### Price-first selection and home-first NodePools
 
@@ -161,6 +172,47 @@ use zone `0` in every region. Spread replicas across regions with a
 constraint alone treats non-zonal nodes in different regions as one domain.
 Karpenter only creates domains that the NodePool requirements and the listed
 regions allow.
+
+### Azure CNI Overlay with an external pod network
+
+`--multi-region-external-pod-network` (`MULTI_REGION_EXTERNAL_POD_NETWORK=true`,
+default `false`) accepts `regions` on Azure CNI Overlay. The controller does not
+start with it unless `--enable-multi-region`, `NETWORK_PLUGIN=azure` and
+`NETWORK_PLUGIN_MODE=overlay` are also set. The provider then bootstraps
+regional nodes as the [node contract](#node-contract) lists and leaves their pod
+network to an agent outside this provider: it writes no CNI configuration beyond
+a home node's and creates no routes, peerings, tunnels or pod address ranges.
+Overlay pod ranges belong to the cluster VNet, so a regional node pairs the
+cluster's `VNET_GUID` in `kubernetes.azure.com/nodenetwork-vnetguid` with the
+name of the subnet its NIC is in.
+
+### Per-region node identities
+
+Where an identity may only be attached to VMs in some regions,
+`--multi-region-node-identities` (`MULTI_REGION_NODE_IDENTITIES`) gives each
+listed region its own identities as a JSON object:
+
+```json
+{"westus2": {"nodeIdentities": ["/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/westus2-nodes"], "kubeletIdentityClientID": "11111111-2222-3333-4444-555555555555"}}
+```
+
+Region keys are lowercased. The controller does not start without
+`--enable-multi-region`, or with unknown fields, a region listed twice, an empty
+`nodeIdentities`, a value that is not a user-assigned identity resource ID or a
+client ID, or an entry for the cluster region. For a VM in a region with an
+entry, the entry replaces `--node-identities` and `--kubelet-identity-client-id`;
+it is never added to them. It sets the VM's user-assigned identities, the kubelet
+identity in the bootstrap configuration and the
+`kubernetes.azure.com/kubelet-identity-client-id` label, and it is the goal state
+of drift detection and in-place updates. A region without an entry uses the
+global values.
+
+### FIPS node images
+
+With `USE_SIG=false`, a NodeClass with `fipsMode: FIPS` currently reports
+`ImagesReady=False` with reason `SIGRequiredForFIPS`. This is a limit of the
+provider code, which resolves FIPS images only through the shared image gallery;
+it does not mean that no public FIPS image exists.
 
 ## Placement, failure isolation and lifecycle
 
@@ -212,6 +264,111 @@ discovery and NIC garbage collection cover all regions; deletion does not
 depend on the NodeClass, regional network validation or a successful quota
 refresh.
 
+## Coexistence mode
+
+Coexistence mode runs this controller beside another Karpenter installation in
+the same cluster, such as AKS node auto-provisioning, that serves
+`karpenter.azure.com` AKSNodeClasses. Enable it with the environment variable
+`COEXISTENCE_MODE=true`. There is no flag and no build tag: a plain
+`go build ./cmd/controller` binary supports it. The value is read once at
+process start; an invalid value stops the controller.
+
+In coexistence mode the controller:
+
+- serves `AKSNodeClass` only as `multiregion.io/v1beta1` (plural
+  `aksnodeclasses`). NodePools reference it with `group: multiregion.io`, and
+  nodes carry `multiregion.io/aksnodeclass` instead of
+  `karpenter.azure.com/aksnodeclass`. All other label, annotation, finalizer and
+  tag domains are unchanged.
+- manages only NodePools, NodeClaims and Nodes whose node class group is
+  `multiregion.io`, and never writes another installation's objects or a
+  `karpenter.azure.com` AKSNodeClass.
+- never installs or changes a CRD, and waits through API discovery until
+  `multiregion.io` is served. Install
+  `pkg/apis/crds/coexistence/multiregion.io_aksnodeclasses.yaml` from the same
+  revision. It serves the `v1beta1` schema of
+  `karpenter.azure.com_aksnodeclasses.yaml` under the new group, and a unit test
+  fails when the two differ. Both installations share the `karpenter.sh`
+  NodePool and NodeClaim CRDs, whose installed schemas must be compatible with
+  this revision.
+- tags every VM, NIC and VM extension it creates with
+  `karpenter.azure.com_owner=multiregion.io` and records the NodePool in
+  `karpenter.azure.com_nodepool` instead of `karpenter.sh_nodepool`. Its Azure
+  Resource Graph listings require both tags, and it refuses to adopt, update or
+  delete a VM or NIC without the owner tag, so garbage collection, adoption,
+  in-place updates and cleanup touch only resources it created. NodeClass and
+  `--additional-tags` entries that would forge these tags or match another
+  installation's listings are dropped.
+- does not start with an AKS Machine API `PROVISION_MODE`, with
+  `MANAGE_EXISTING_AKS_MACHINES=true`, or with the `NodeOverlay` or
+  `CapacityBuffer` feature gate on, because both installations would reconcile
+  those cluster-wide objects.
+
+Give each `multiregion.io` AKSNodeClass a name that no `karpenter.azure.com`
+AKSNodeClass has. A controller outside coexistence mode resolves a NodeClaim's
+node class by kind and name only; once a same-named class exists, its in-place
+update rewrites the tags of this controller's VMs and removes the owner tag.
+Static validation therefore gets the metadata of a `karpenter.azure.com/v1beta1`
+AKSNodeClass with the same name and sets `ValidationSucceeded=False` with reason
+`ForeignNodeClassNameConflict` while one exists, or with reason
+`ForeignNodeClassCheckForbidden` when it may not read that group. The check
+repeats at least every five minutes. When the controller refuses to delete a VM
+that lacks the owner tag, the NodeClaim keeps its finalizer and gets a
+`VirtualMachineNotOwned` warning event; restore the tag on the VM, or delete the
+VM, so that the NodeClaim can terminate.
+
+Both installations see every pending pod. Taint the coexistence NodePools and
+give their pods the toleration and a `multiregion.io/aksnodeclass` node
+selector, so that only one installation can place each pod.
+
+Beyond the default rules, coexistence mode needs these Kubernetes permissions:
+`get`, `list`, `watch`, `patch` and `update` on `aksnodeclasses.multiregion.io`,
+`patch` and `update` on its `status`, and `get` on
+`aksnodeclasses.karpenter.azure.com`. It needs no permission on CRDs and no write
+on `karpenter.azure.com` AKSNodeClasses. The Helm chart of this revision grants
+these rules for the default group only.
+
+## Node contract
+
+These properties hold for every node of a NodeClass with `regions` on Azure CNI
+Overlay with `--multi-region-external-pod-network`. Kubelet gets the labels below
+through `--node-labels` and the NodePool's `taints` and `startupTaints` through
+`--register-with-taints`. Karpenter adds the NodeClaim labels at registration,
+including `karpenter.sh/nodepool`, the node class label and
+`topology.kubernetes.io/region`.
+
+| Label | Value |
+| --- | --- |
+| `kubernetes.azure.com/cluster` | the node resource group, normalized as for home nodes |
+| `kubernetes.azure.com/role`, `kubernetes.azure.com/mode` | `agent`, `user` |
+| `kubernetes.azure.com/kubelet-identity-client-id` | the kubelet identity of the placement region |
+| `kubernetes.azure.com/network-subnet` | the name of the placement subnet |
+| `kubernetes.azure.com/nodenetwork-vnetguid` | `VNET_GUID`, the cluster VNet |
+| `kubernetes.azure.com/azure-cni-overlay` | `true` |
+| `kubernetes.azure.com/podnetwork-type` | `overlay` |
+| `kubernetes.azure.com/network-stateless-cni` | `true` from Kubernetes 1.34, otherwise `false` |
+| `kubernetes.azure.com/ebpf-dataplane` | `cilium` when `NETWORK_DATAPLANE=cilium` |
+| `kubernetes.azure.com/os-sku`, `os-sku-requested`, `os-sku-effective` | from the image family |
+| `kubernetes.azure.com/fips_enabled` | `true` for a FIPS NodeClass |
+| `kubernetes.azure.com/scalesetpriority`, `kubernetes.azure.com/priority` | `regular` for on-demand nodes |
+| `kubernetes.azure.com/localdns-state` | `enabled` or `disabled` |
+| `karpenter.sh/do-not-sync-taints` | `true` |
+| `node.kubernetes.io/exclude-from-external-load-balancers` | `true` |
+
+- The VM and its NIC are in the cluster's node resource group at the placement
+  region, and the VM name is the node name.
+- The NIC's primary IP configuration is in the placement subnet, with no NSG and
+  no load-balancer backend pools.
+- The VM's user-assigned identities are the region's `nodeIdentities`, or
+  `--node-identities` for a region without an entry.
+- The bootstrap configuration has the placement region as its location, the
+  placement subnet, VNet and VNet resource group, empty NSG and route table
+  names, the region's kubelet identity client ID, and no CNI configuration, as
+  on a home node of an overlay cluster.
+- The VM, NIC and extensions are tagged with `karpenter.azure.com_cluster`
+  (`CLUSTER_NAME`), `compute.aks.billing=linux`, the NodePool tag and, in
+  coexistence mode, the owner tag, plus NodeClass `tags` and `--additional-tags`.
+
 ## Reproducible builds
 
 Use the repository Go/toolchain versions. For the exact checked-out fork commit,
@@ -235,7 +392,8 @@ trivy image --input artifacts/controller-aks.tar --ignore-unfixed --exit-code 1
 sha256sum artifacts/controller*.tar
 ```
 
-The `-aks`/`ccp` image is the managed build variant. Keep scans and the
+Coexistence mode, the overlay opt-in and per-region identities are runtime
+options that need no build tag. The `-aks`/`ccp` image is the managed build variant. Keep scans and the
 maintainer-controlled release gates intact; a personal fork cannot publish to
 the official AKS image repository. Use a digest-pinned image from the exact
 tested commit for any separately authorized deployment.
@@ -251,7 +409,12 @@ adds pending-pod scheduling through the real provider with synthetic Azure APIs,
 two physical-location payloads, NIC isolation, retry/discovery/deletion, and
 stale-readiness rejection, the operator gate, refresh failure, cold start and
 placement drift. API/hash and image maintenance tests extend the
-existing suites. These are **not proof** of Azure provisioning or managed CNI.
+existing suites. `pkg/coexistencesuite` runs controller and provider specs with
+`COEXISTENCE_MODE=true`: other installations' NodePools, NodeClaims, Nodes, VMs
+and NICs stay unchanged, the listing queries and the name check are exact, and
+refusals are reported. The default build is also tested against
+coexistence-tagged resources. These are **not proof** of Azure provisioning,
+managed CNI, or the behavior of another installation's binary.
 
 The existing integration suite includes an opt-in live test. On a separately
 authorized, dedicated cluster running this exact fork, started with

@@ -28,6 +28,9 @@ import (
 const (
 	AsyncProvisioningReason   = "AsyncProvisioningError"
 	NodeClassResolutionReason = "NodeClassResolutionError"
+	// VirtualMachineNotOwnedReason marks a NodeClaim whose VM this controller refuses to delete
+	// because the VM lacks the owner tag of this controller's mode.
+	VirtualMachineNotOwnedReason = "VirtualMachineNotOwned"
 )
 
 func NodePoolFailedToResolveNodeClass(nodePool *v1.NodePool) events.Event {
@@ -56,6 +59,19 @@ func NodeClaimFailedToRegister(nodeClaim *v1.NodeClaim, err error) events.Event 
 		Type:           corev1.EventTypeWarning,
 		Reason:         AsyncProvisioningReason,
 		Message:        fmt.Sprintf("Failed to register: %s", truncateMessage(err.Error())),
+		DedupeValues:   []string{string(nodeClaim.UID)},
+	}
+}
+
+// NodeClaimVirtualMachineNotOwned reports that this controller refused to delete the NodeClaim's VM
+// because the VM lacks its owner tag. The NodeClaim keeps its finalizer until the tag is restored or
+// the VM is deleted by other means.
+func NodeClaimVirtualMachineNotOwned(nodeClaim *v1.NodeClaim, err error) events.Event {
+	return events.Event{
+		InvolvedObject: nodeClaim,
+		Type:           corev1.EventTypeWarning,
+		Reason:         VirtualMachineNotOwnedReason,
+		Message:        truncateMessage(err.Error()),
 		DedupeValues:   []string{string(nodeClaim.UID)},
 	}
 }

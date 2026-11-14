@@ -28,6 +28,10 @@ import (
 )
 
 func init() {
+	if apis.CoexistenceMode() {
+		// Coexistence mode serves only v1beta1 under its own group and never uses this group.
+		return
+	}
 	gv := schema.GroupVersion{Group: apis.Group, Version: "v1alpha2"}
 	corev1.AddToGroupVersion(scheme.Scheme, gv)
 	scheme.Scheme.AddKnownTypes(gv,

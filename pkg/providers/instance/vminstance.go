@@ -410,6 +410,9 @@ func (p *DefaultVMProvider) deleteImpl(ctx context.Context, resourceName string)
 	if err != nil {
 		return corecloudprovider.IsNodeClaimNotFoundError(err), err
 	}
+	if !launchtemplate.IsOwned(vm.Tags) {
+		return false, &NotOwnedError{ResourceName: resourceName}
+	}
 	// Check if the instance is already shutting down to reduce the number of API calls.
 	// Leftover network interfaces (if any) will be cleaned by by GC controller.
 	if utils.IsVMDeleting(*vm) {
@@ -421,6 +424,27 @@ func (p *DefaultVMProvider) deleteImpl(ctx context.Context, resourceName string)
 		return false, err
 	}
 	return true, nil
+}
+
+// NotOwnedError reports a virtual machine that this controller refuses to delete because the VM
+// lacks the owner tag of this controller's mode. In coexistence mode that happens when another
+// controller replaced the VM's tags.
+type NotOwnedError struct {
+	ResourceName string
+}
+
+func (e *NotOwnedError) Error() string {
+	msg := fmt.Sprintf("refusing to delete virtual machine %q: it was not created by this controller", e.ResourceName)
+	if owner := launchtemplate.OwnerTagValue(); owner != "" {
+		msg += fmt.Sprintf("; if it was, restore its tag %s=%s or delete it so that its NodeClaim can terminate", launchtemplate.OwnerTagKey, owner)
+	}
+	return msg
+}
+
+// IsNotOwnedError reports whether err is or wraps a NotOwnedError.
+func IsNotOwnedError(err error) bool {
+	var notOwned *NotOwnedError
+	return errors.As(err, &notOwned)
 }
 
 func (p *DefaultVMProvider) GetNic(ctx context.Context, rg, nicName string) (*armnetwork.Interface, error) {
@@ -458,6 +482,23 @@ func (p *DefaultVMProvider) ListNics(ctx context.Context) ([]*armnetwork.Interfa
 }
 
 func (p *DefaultVMProvider) DeleteNic(ctx context.Context, nicName string) error {
+	return p.deleteOwnedNicIfExists(ctx, nicName)
+}
+
+// deleteOwnedNicIfExists deletes a NIC unless, in coexistence mode, another controller created it.
+func (p *DefaultVMProvider) deleteOwnedNicIfExists(ctx context.Context, nicName string) error {
+	if launchtemplate.OwnerTagValue() != "" {
+		nic, err := p.azClient.NetworkInterfacesClient().Get(ctx, p.resourceGroup, nicName, nil)
+		if err != nil {
+			if sdkerrors.IsNotFoundErr(err) {
+				return nil
+			}
+			return err
+		}
+		if !launchtemplate.IsOwned(nic.Tags) {
+			return fmt.Errorf("refusing to delete network interface %q: it was not created by this controller", nicName)
+		}
+	}
 	return deleteNicIfExists(ctx, p.azClient.NetworkInterfacesClient(), p.resourceGroup, nicName)
 }
 
@@ -879,6 +920,10 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 	existing, err := p.azClient.VirtualMachinesClient().Get(ctx, p.resourceGroup, resourceName, nil)
 	// If status == ok, we want to return the existing vmm
 	if err == nil {
+		// Coexistence mode never adopts a VM that another controller created.
+		if !launchtemplate.IsOwned(existing.Tags) {
+			return nil, fmt.Errorf("virtual machine %q exists but was not created by this controller", resourceName)
+		}
 		// TODO: Replace this field-specific check with ownership and launch-intent
 		// validation before reusing an existing VM. Other NodeClass inputs that configure
 		// immutable VM properties can also change between creation attempts.
@@ -980,7 +1025,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		Location:            p.location,
 		SSHPublicKey:        options.FromContext(ctx).SSHPublicKey,
 		LinuxAdminUsername:  options.FromContext(ctx).LinuxAdminUsername,
-		NodeIdentities:      options.FromContext(ctx).NodeIdentities,
+		NodeIdentities:      options.FromContext(ctx).NodeIdentitiesFor(p.location),
 		NodeClass:           nodeClass,
 		LaunchTemplate:      launchTemplate,
 		InstanceType:        instanceType,
@@ -1125,7 +1170,7 @@ func (p *DefaultVMProvider) cleanupAzureResources(ctx context.Context, resourceN
 	// nic, disk and all associated resources will be removed. If the VM was not created successfully and a nic was found,
 	// then we attempt to delete the nic.
 
-	nicErr := deleteNicIfExists(ctx, p.azClient.NetworkInterfacesClient(), p.resourceGroup, resourceName)
+	nicErr := p.deleteOwnedNicIfExists(ctx, resourceName)
 
 	if mustDeleteNic {
 		// Don't log NIC error here since mustDeleteNic is true (critical cleanup scenario).
@@ -1145,12 +1190,15 @@ func (p *DefaultVMProvider) cleanupAzureResources(ctx context.Context, resourceN
 
 // deleteVirtualMachineIfExists checks if a virtual machine exists, and if it does, we delete it with a cascading delete
 func (p *DefaultVMProvider) deleteVirtualMachineIfExists(ctx context.Context, vmName string) error {
-	_, err := p.azClient.VirtualMachinesClient().Get(ctx, p.resourceGroup, vmName, nil)
+	vm, err := p.azClient.VirtualMachinesClient().Get(ctx, p.resourceGroup, vmName, nil)
 	if err != nil {
 		if sdkerrors.IsNotFoundErr(err) {
 			return nil
 		}
 		return err
+	}
+	if !launchtemplate.IsOwned(vm.Tags) {
+		return &NotOwnedError{ResourceName: vmName}
 	}
 	return p.deleteVirtualMachine(ctx, vmName)
 }

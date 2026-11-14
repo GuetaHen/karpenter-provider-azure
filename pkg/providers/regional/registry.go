@@ -49,6 +49,29 @@ const (
 	retryBackoff = time.Minute
 )
 
+// RegionNotLoadedReason is the SubnetsReady reason while a region has never loaded its SKU catalog.
+const RegionNotLoadedReason = "RegionalCatalogUnavailable"
+
+// regionNotLoadedError names a region that has never loaded its SKU catalog. Its reason lets
+// the subnet status reconciler report it without importing this package.
+type regionNotLoadedError struct {
+	region string
+	err    error
+}
+
+func (e *regionNotLoadedError) Error() string {
+	return fmt.Sprintf("region %s has no SKU catalog yet: %v", e.region, e.err)
+}
+
+func (e *regionNotLoadedError) Unwrap() error {
+	return e.err
+}
+
+// Reason is the status condition reason for this error.
+func (e *regionNotLoadedError) Reason() string {
+	return RegionNotLoadedReason
+}
+
 type Providers struct {
 	Types     instancetype.Provider
 	Images    imagefamily.NodeImageProvider
@@ -121,7 +144,7 @@ func (r *Registry) get(ctx context.Context, region string) (*entry, error) {
 	now := r.clock.Now()
 	p.refreshSKUs(ctx, region, now)
 	if !p.hydrated {
-		return nil, fmt.Errorf("region %s has no SKU catalog yet: %w", region, p.skusErr)
+		return nil, &regionNotLoadedError{region: region, err: p.skusErr}
 	}
 	p.refreshQuota(ctx, region, now)
 	return p, nil
@@ -170,6 +193,11 @@ func (r *Registry) ValidateSubnets(ctx context.Context, nodeClass *v1beta1.AKSNo
 	for _, region := range nodeClass.Spec.Regions {
 		if err := r.validate(ctx, region); err != nil {
 			return fmt.Errorf("region %s subnet: %w", region.Name, err)
+		}
+		// A region that has never loaded its SKU catalog keeps the NodeClass not ready. The
+		// subnet reconciler retries with backoff, so the condition clears once the region loads.
+		if _, err := r.get(ctx, region.Name); err != nil {
+			return err
 		}
 	}
 	return nil
