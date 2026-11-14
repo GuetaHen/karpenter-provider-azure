@@ -209,10 +209,42 @@ global values.
 
 ### FIPS node images
 
-With `USE_SIG=false`, a NodeClass with `fipsMode: FIPS` currently reports
-`ImagesReady=False` with reason `SIGRequiredForFIPS`. This is a limit of the
-provider code, which resolves FIPS images only through the shared image gallery;
-it does not mean that no public FIPS image exists.
+With `USE_SIG=false`, a NodeClass with `fipsMode: FIPS` reports
+`ImagesReady=False` with reason `SIGRequiredForFIPS`, unless the controller runs
+with `--community-gallery-fips-images` (`COMMUNITY_GALLERY_FIPS_IMAGES=true`,
+default `false`). With it, a FIPS NodeClass of `imageFamily: AzureLinux`
+resolves its FIPS node images from the public Azure Linux community gallery,
+separately in the cluster region and in every `regions` entry, the way non-FIPS
+community images are resolved:
+
+- Only FIPS image definitions are used: `V3gen2fips`, `V3fips` and
+  `V3gen2arm64fips` for Azure Linux 3, `V2gen2fips` and `V2fips` for Azure
+  Linux 2. Each gets its newest published version. Placeholder versions such as
+  `0.0.0` and versions excluded from latest are never selected, and there is no
+  fallback to a non-FIPS image.
+- A definition that a region does not publish is skipped there, so instance
+  types that only it serves (for example arm64) cannot launch in that region;
+  restrict `kubernetes.io/arch` and `karpenter.azure.com/sku-hyperv-generation`
+  in the NodePool if that matters. A region with none of the definitions sets
+  `ImagesReady=False` with reason `FIPSImagesNotFound` and a message that names
+  the region. The images resolved before are kept, so existing nodes do not
+  drift.
+- Other image families report reason `CommunityGalleryFIPSImagesUnavailable`:
+  the Ubuntu community gallery lists a FIPS definition whose only version is a
+  placeholder.
+- Nodes get `kubernetes.azure.com/fips_enabled=true`. Image version maintenance
+  and image drift work as for non-FIPS community images.
+- The option has no effect with `USE_SIG=true`.
+
+`ENABLE_FIPS=true` selects no images. It requires `fipsMode: FIPS` on every
+NodeClass that this controller serves (reason `FIPSRequired` otherwise) and
+refuses launches for any other NodeClass. Set it with
+`COMMUNITY_GALLERY_FIPS_IMAGES=true` when every NodeClass must be FIPS.
+
+The scriptless bootstrap has no FIPS setting: as in AKS node bootstrapping for
+Linux, FIPS is a property of the node image. Only a live node can show that the
+bootstrap completes on the FIPS image and that the kernel runs in FIPS mode
+(`/proc/sys/crypto/fips_enabled` is `1`).
 
 ## Placement, failure isolation and lifecycle
 
@@ -361,6 +393,9 @@ including `karpenter.sh/nodepool`, the node class label and
   no load-balancer backend pools.
 - The VM's user-assigned identities are the region's `nodeIdentities`, or
   `--node-identities` for a region without an entry.
+- A FIPS NodeClass boots the FIPS image of the placement region (see
+  [FIPS node images](#fips-node-images)); its bootstrap configuration is the
+  same as for other nodes.
 - The bootstrap configuration has the placement region as its location, the
   placement subnet, VNet and VNet resource group, empty NSG and route table
   names, the region's kubelet identity client ID, and no CNI configuration, as

@@ -17,8 +17,10 @@ limitations under the License.
 package imagefamily_test
 
 import (
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
@@ -117,6 +119,87 @@ var _ = Describe("NodeImageProvider tests", func() {
 
 		nodeClass = test.AKSNodeClass(test.WithVersionBasedDefaults(env.Version))
 		test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
+	})
+
+	Context("List community gallery FIPS images", func() {
+		published := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+		communityVersion := func(name string, age time.Duration, excludeFromLatest bool) *armcompute.CommunityGalleryImageVersion {
+			return &armcompute.CommunityGalleryImageVersion{Name: lo.ToPtr(name), Properties: &armcompute.CommunityGalleryImageVersionProperties{
+				PublishedDate: lo.ToPtr(published.Add(-age)), ExcludeFromLatest: lo.ToPtr(excludeFromLatest),
+			}}
+		}
+		// expectedImages lists the FIPS image definitions of the NodeClass at version, except the skipped ones.
+		expectedImages := func(version string, skipped ...string) []imagefamily.NodeImage {
+			images := []imagefamily.NodeImage{}
+			family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, kubernetesVersion, nil)
+			for _, image := range family.DefaultImages(true, nodeClass.Spec.FIPSMode, false, false) {
+				if !lo.Contains(skipped, image.ImageDefinition) {
+					images = append(images, imagefamily.NodeImage{ID: imagefamily.BuildImageIDCIG(image.PublicGalleryURL, image.ImageDefinition, version), Requirements: image.Requirements})
+				}
+			}
+			return images
+		}
+		definitions := func() []string {
+			family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, kubernetesVersion, nil)
+			defaultImages := family.DefaultImages(true, nodeClass.Spec.FIPSMode, false, false)
+			names := make([]string, 0, len(defaultImages))
+			for _, image := range defaultImages {
+				names = append(names, image.ImageDefinition)
+			}
+			return names
+		}
+
+		BeforeEach(func() {
+			testOptions.CommunityGalleryFIPSImages = true
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+			nodeClass.Spec.FIPSMode = lo.ToPtr(v1beta1.FIPSModeFIPS)
+			communityImageVersionsAPI.Reset()
+			communityImageVersionsAPI.ImageVersions.Append(communityVersion(cigImageVersion, 48*time.Hour, false))
+			communityImageVersionsAPI.ImageVersions.Append(communityVersion(laterCIGImageVersion, 24*time.Hour, false))
+		})
+
+		It("resolves only FIPS image definitions, each at its newest version", func() {
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(images).ToNot(BeEmpty())
+			Expect(images).To(Equal(expectedImages(laterCIGImageVersion)))
+			for _, image := range images {
+				Expect(strings.ToLower(image.ID)).To(ContainSubstring("fips"))
+			}
+		})
+
+		It("never selects a placeholder or excluded version, even a newer one", func() {
+			communityImageVersionsAPI.ImageVersions.Append(communityVersion("0.0.0", 0, false))
+			communityImageVersionsAPI.ImageVersions.Append(communityVersion("209912.01.0", 0, true))
+			Expect(nodeImageProvider.List(ctx, nodeClass)).To(Equal(expectedImages(laterCIGImageVersion)))
+		})
+
+		It("skips an image definition that the region does not publish", func() {
+			missing := definitions()[0]
+			communityImageVersionsAPI.NotFoundImageDefinitions = []string{missing}
+			Expect(nodeImageProvider.List(ctx, nodeClass)).To(Equal(expectedImages(laterCIGImageVersion, missing)))
+		})
+
+		It("names the region without a usable FIPS image and never falls back to non-FIPS images", func() {
+			communityImageVersionsAPI.NotFoundImageDefinitions = definitions()[1:]
+			communityImageVersionsAPI.ImageVersions.Reset()
+			communityImageVersionsAPI.ImageVersions.Append(communityVersion("0.0.0", 0, false))
+			images, err := nodeImageProvider.List(ctx, nodeClass)
+			Expect(images).To(BeEmpty())
+			var notFound *imagefamily.FIPSImagesNotFoundError
+			Expect(errors.As(err, &notFound)).To(BeTrue())
+			Expect(notFound.Location).To(Equal(fake.Region))
+			Expect(notFound.ImageDefinitions).To(ConsistOf(definitions()))
+			Expect(err).To(MatchError(ContainSubstring("region " + fake.Region)))
+		})
+
+		It("lists no FIPS images without the option, as before, or for Ubuntu", func() {
+			testOptions.CommunityGalleryFIPSImages = false
+			Expect(nodeImageProvider.List(ctx, nodeClass)).To(BeEmpty())
+			testOptions.CommunityGalleryFIPSImages = true
+			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
+			Expect(nodeImageProvider.List(ctx, nodeClass)).To(BeEmpty())
+		})
 	})
 
 	Context("List CIG Images", func() {

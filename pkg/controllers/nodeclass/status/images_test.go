@@ -23,6 +23,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
+	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 
@@ -559,6 +560,73 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 
 			readyCondition := nodeClass.StatusConditions().Get(opstatus.ConditionReady)
 			Expect(readyCondition.IsFalse()).To(BeTrue())
+		})
+
+		Context("with --community-gallery-fips-images", func() {
+			const fipsVersion = "202610.30.1"
+			fipsDefinitions := func() []string {
+				family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, testK8sVersion, nil)
+				defaultImages := family.DefaultImages(true, nodeClass.Spec.FIPSMode, false, false)
+				names := make([]string, 0, len(defaultImages))
+				for _, image := range defaultImages {
+					names = append(names, image.ImageDefinition)
+				}
+				return names
+			}
+			fipsImageIDs := func() []string {
+				return lo.Map(fipsDefinitions(), func(name string, _ int) string {
+					return imagefamily.BuildImageIDCIG(imagefamily.AKSAzureLinuxPublicGalleryURL, name, fipsVersion)
+				})
+			}
+
+			BeforeEach(func() {
+				ctx = test.Options(test.OptionsFields{
+					UseSIG:                     lo.ToPtr(false),
+					CommunityGalleryFIPSImages: lo.ToPtr(true),
+				}).ToContext(ctx)
+				nodeClass.Spec.FIPSMode = &v1beta1.FIPSModeFIPS
+				nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+				// A FIPS NodeClass that has not resolved images yet.
+				nodeClass.Status.Images = nil
+				nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "Unresolved", "not resolved yet")
+				azureEnv.NodeImagesCache.Flush()
+				azureEnv.CommunityImageVersionsAPI.ImageVersions.Append(&armcompute.CommunityGalleryImageVersion{
+					Name:       lo.ToPtr(fipsVersion),
+					Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC))},
+				})
+				DeferCleanup(func() { azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = nil })
+			})
+
+			It("resolves only FIPS images from the community gallery", func() {
+				_, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+				Expect(lo.Map(nodeClass.Status.Images, func(image v1beta1.NodeImage, _ int) string { return image.ID })).To(ConsistOf(fipsImageIDs()))
+			})
+
+			It("reports an image family without community gallery FIPS images", func() {
+				nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
+				_, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady)
+				Expect(condition.IsFalse()).To(BeTrue())
+				Expect(condition.Reason).To(Equal(imagefamily.CommunityGalleryFIPSImagesUnavailableReason))
+				Expect(nodeClass.Status.Images).To(BeNil())
+			})
+
+			It("names the region without a FIPS image and keeps the resolved images", func() {
+				azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()
+				resolved := []v1beta1.NodeImage{{ID: fipsImageIDs()[0]}}
+				nodeClass.Status.Images = resolved
+				result, err := imageReconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(result.RequeueAfter).ToNot(BeZero())
+				condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady)
+				Expect(condition.IsFalse()).To(BeTrue())
+				Expect(condition.Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+				Expect(condition.Message).To(ContainSubstring("region " + fake.Region))
+				Expect(nodeClass.Status.Images).To(Equal(resolved))
+			})
 		})
 	})
 })

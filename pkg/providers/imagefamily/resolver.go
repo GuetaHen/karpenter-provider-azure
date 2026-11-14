@@ -155,7 +155,8 @@ func (r *defaultResolver) Resolve(
 	)
 
 	// TODO: as ProvisionModeBootstrappingClient path develops, we will eventually be able to drop the retrieval of imageDistro here.
-	useSIG := options.FromContext(ctx).UseSIG
+	// Community gallery FIPS images use the FIPS image definitions that DefaultImages lists for SIG.
+	useSIG := listsSIGImageDefinitions(ctx, nodeClass)
 	imageDistro, err := mapToImageDistro(imageID, nodeClass.Spec.FIPSMode, imageFamily, useSIG, nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
 	if err != nil {
 		return nil, err

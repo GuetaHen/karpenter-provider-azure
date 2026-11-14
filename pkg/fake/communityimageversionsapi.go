@@ -18,9 +18,12 @@ package fake
 
 import (
 	"context"
+	"net/http"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/samber/lo"
 
 	imagefamilytypes "github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily/types"
 )
@@ -28,18 +31,25 @@ import (
 // TODO: no ability to simulate errors on the Pager.
 type CommunityGalleryImageVersionsAPI struct {
 	ImageVersions AtomicPtrSlice[armcompute.CommunityGalleryImageVersion]
+	// NotFoundImageDefinitions names image definitions whose version listing fails with not found, like an
+	// image definition that the location does not publish.
+	NotFoundImageDefinitions []string
 }
 
 // assert that the fake implements the interface
 var _ imagefamilytypes.CommunityGalleryImageVersionsAPI = &CommunityGalleryImageVersionsAPI{}
 
 // NewListPager returns a new pager to return the next page of CommunityGalleryImageVersionsClientListResponse
-func (c *CommunityGalleryImageVersionsAPI) NewListPager(_ string, _ string, _ string, _ *armcompute.CommunityGalleryImageVersionsClientListOptions) *runtime.Pager[armcompute.CommunityGalleryImageVersionsClientListResponse] {
+func (c *CommunityGalleryImageVersionsAPI) NewListPager(_ string, _ string, galleryImageName string, _ *armcompute.CommunityGalleryImageVersionsClientListOptions) *runtime.Pager[armcompute.CommunityGalleryImageVersionsClientListResponse] {
+	notFound := lo.Contains(c.NotFoundImageDefinitions, galleryImageName)
 	pagingHandler := runtime.PagingHandler[armcompute.CommunityGalleryImageVersionsClientListResponse]{
 		More: func(page armcompute.CommunityGalleryImageVersionsClientListResponse) bool {
 			return false
 		},
 		Fetcher: func(ctx context.Context, _ *armcompute.CommunityGalleryImageVersionsClientListResponse) (armcompute.CommunityGalleryImageVersionsClientListResponse, error) {
+			if notFound {
+				return armcompute.CommunityGalleryImageVersionsClientListResponse{}, &azcore.ResponseError{StatusCode: http.StatusNotFound, ErrorCode: "ResourceNotFound"}
+			}
 			output := armcompute.CommunityGalleryImageVersionList{
 				Value: []*armcompute.CommunityGalleryImageVersion{},
 			}
@@ -57,4 +67,5 @@ func (c *CommunityGalleryImageVersionsAPI) Reset() {
 		return
 	}
 	c.ImageVersions.Reset()
+	c.NotFoundImageDefinitions = nil
 }

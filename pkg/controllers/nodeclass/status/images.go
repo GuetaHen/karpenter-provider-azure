@@ -18,6 +18,7 @@ package status
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -118,10 +119,16 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 
 	// validate FIPS + useSIG
 	useSIG := options.FromContext(ctx).UseSIG
-	if nodeClass.IsFIPSEnabled() && !useSIG {
+	if nodeClass.IsFIPSEnabled() && !useSIG && !options.FromContext(ctx).CommunityGalleryFIPSImages {
 		nodeClass.Status.Images = nil
 		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "SIGRequiredForFIPS", "FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)")
 		logger.Info("FIPS images require SIG", "error", fmt.Errorf("FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)"))
+		return reconcile.Result{}, nil
+	}
+	if nodeClass.IsFIPSEnabled() && !useSIG && !imagefamily.HasCommunityGalleryFIPSImages(nodeClass) {
+		nodeClass.Status.Images = nil
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, imagefamily.CommunityGalleryFIPSImagesUnavailableReason,
+			fmt.Sprintf("imageFamily %q publishes no usable FIPS node image in the public community gallery; use imageFamily %s, or UseSIG", lo.FromPtr(nodeClass.Spec.ImageFamily), v1beta1.AzureLinuxImageFamily))
 		return reconcile.Result{}, nil
 	}
 
@@ -134,6 +141,11 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	unpinning := reqImgVer == "" && nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason == nodeImageVersionPinnedReason
 
 	nodeImages, err := r.nodeImageProvider.List(ctx, nodeClass)
+	if notFound := new(imagefamily.FIPSImagesNotFoundError); stderrors.As(err, &notFound) {
+		// Launches stop until every region has a FIPS image. The resolved images stay, so nodes do not drift.
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, imagefamily.FIPSImagesNotFoundReason, notFound.Error())
+		return reconcile.Result{RequeueAfter: requeueTime}, nil
+	}
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("getting nodeimages, %w", err)
 	}

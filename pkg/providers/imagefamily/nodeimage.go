@@ -77,10 +77,12 @@ func NewProvider(versionsClient types.CommunityGalleryImageVersionsAPI, location
 func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]NodeImage, error) {
 	// TODO: refactor to be part of construction, since this is a karpenter setting and won't change across the process.
 	useSIG := options.FromContext(ctx).UseSIG
+	communityFIPS := listsCommunityGalleryFIPSImages(options.FromContext(ctx), nodeClass)
 
 	// CIG has no FIPS images; FIPS images can only be accessed through SIG
 	// (this won't be an error since there just aren't any FIPS images for CIG)
-	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS && !useSIG {
+	// --community-gallery-fips-images resolves the FIPS images that the Azure Linux community gallery does publish.
+	if lo.FromPtr(nodeClass.Spec.FIPSMode) == v1beta1.FIPSModeFIPS && !useSIG && !communityFIPS {
 		return []NodeImage{}, nil
 	}
 
@@ -92,7 +94,7 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 		return []NodeImage{}, nil
 	}
 
-	supportedImages := getSupportedImages(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, useSIG, nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
+	supportedImages := getSupportedImages(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, listsSIGImageDefinitions(ctx, nodeClass), nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
 
 	key, err := p.cacheKey(
 		supportedImages,
@@ -106,22 +108,25 @@ func (p *provider) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([
 		return nodeImages.([]NodeImage), nil
 	}
 
-	var nodeImages []NodeImage
-	if useSIG {
-		log.FromContext(ctx).V(1).Info("using SIG to list node images")
-		nodeImages, err = p.listSIG(ctx, supportedImages)
-		if err != nil {
-			return []NodeImage{}, err
-		}
-	} else {
-		nodeImages, err = p.listCIG(ctx, supportedImages)
-		if err != nil {
-			return []NodeImage{}, err
-		}
+	nodeImages, err := p.listImages(ctx, useSIG, communityFIPS, supportedImages)
+	if err != nil {
+		return []NodeImage{}, err
 	}
 	p.nodeImagesCache.Set(key, nodeImages, cache.DefaultExpiration)
 
 	return nodeImages, nil
+}
+
+func (p *provider) listImages(ctx context.Context, useSIG, communityFIPS bool, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {
+	switch {
+	case useSIG:
+		log.FromContext(ctx).V(1).Info("using SIG to list node images")
+		return p.listSIG(ctx, supportedImages)
+	case communityFIPS:
+		return p.listCommunityFIPS(ctx, supportedImages)
+	default:
+		return p.listCIG(ctx, supportedImages)
+	}
 }
 
 func (p *provider) listSIG(ctx context.Context, supportedImages []types.DefaultImageOutput) ([]NodeImage, error) {

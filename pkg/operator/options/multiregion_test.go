@@ -17,9 +17,13 @@ limitations under the License.
 package options_test
 
 import (
+	"flag"
+	"os"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
@@ -35,6 +39,24 @@ func identityID(name string) string {
 func identitiesJSON(region, identity, clientID string) string {
 	return `"` + region + `": {"nodeIdentities": ["` + identity + `"], "kubeletIdentityClientID": "` + clientID + `"}`
 }
+
+var _ = Describe("Community gallery FIPS images option", func() {
+	parse := func(args ...string) *options.Options {
+		fs := &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+		opts := &options.Options{}
+		opts.AddFlags(fs)
+		Expect(fs.Parse(args)).To(Succeed())
+		return opts
+	}
+
+	It("defaults to false and is set by its flag or COMMUNITY_GALLERY_FIPS_IMAGES", func() {
+		Expect(parse().CommunityGalleryFIPSImages).To(BeFalse())
+		Expect(parse("--community-gallery-fips-images").CommunityGalleryFIPSImages).To(BeTrue())
+		Expect(os.Setenv("COMMUNITY_GALLERY_FIPS_IMAGES", "true")).To(Succeed())
+		DeferCleanup(os.Unsetenv, "COMMUNITY_GALLERY_FIPS_IMAGES")
+		Expect(parse().CommunityGalleryFIPSImages).To(BeTrue())
+	})
+})
 
 var _ = Describe("Multi-region overlay and identity options", func() {
 	It("accepts Azure CNI Overlay for spec.regions only with the external pod network opt-in", func() {

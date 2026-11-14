@@ -479,6 +479,7 @@ var _ = Describe("CloudProvider", func() {
 
 		Context("Multi-region", func() {
 			var remote *test.Environment
+			var regionalImages *regional.Images
 			BeforeEach(func() {
 				testOptions.NetworkPlugin = consts.NetworkPluginNone
 				testOptions.NetworkPluginMode = ""
@@ -500,7 +501,7 @@ var _ = Describe("CloudProvider", func() {
 					return nil
 				}).WithClock(fakeClock)
 				regionalTypes := &regional.InstanceTypes{Provider: azureEnv.InstanceTypesProvider, Registry: registry}
-				regionalImages := &regional.Images{NodeImageProvider: azureEnv.ImageProvider, Registry: registry}
+				regionalImages = &regional.Images{NodeImageProvider: azureEnv.ImageProvider, Registry: registry}
 				regionalVMs := &regional.Instances{VMProvider: azureEnv.VMInstanceProvider, Registry: registry, KubeClient: env.Client}
 				cloudProvider = New(regionalTypes, regionalVMs, azureEnv.AKSMachineProvider, recorder, env.Client, regionalImages, azureEnv.InstanceTypeStore, false)
 				cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
@@ -674,6 +675,66 @@ var _ = Describe("CloudProvider", func() {
 					Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
 					Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(regionalSubnetID))
 				}
+			})
+			Context("FIPS images from the community gallery", func() {
+				fipsDefinitions := func() []string {
+					family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, lo.Must(nodeClass.GetKubernetesVersion()), nil)
+					defaultImages := family.DefaultImages(true, nodeClass.Spec.FIPSMode, false, false)
+					names := make([]string, 0, len(defaultImages))
+					for _, image := range defaultImages {
+						names = append(names, image.ImageDefinition)
+					}
+					return names
+				}
+				fipsImageIDs := func(version string) []string {
+					return lo.Map(fipsDefinitions(), func(name string, _ int) string {
+						return imagefamily.BuildImageIDCIG(imagefamily.AKSAzureLinuxPublicGalleryURL, name, version)
+					})
+				}
+				communityVersion := func(name string, published time.Time) *armcompute.CommunityGalleryImageVersion {
+					return &armcompute.CommunityGalleryImageVersion{Name: lo.ToPtr(name), Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(published)}}
+				}
+				BeforeEach(func() {
+					testOptions.CommunityGalleryFIPSImages = true
+					nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
+					nodeClass.Spec.FIPSMode = lo.ToPtr(v1beta1.FIPSModeFIPS)
+					published := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+					azureEnv.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202610.23.0", published.AddDate(0, 0, -7)))
+					remote.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202610.30.1", published))
+				})
+				It("should resolve FIPS images in each region and launch FIPS nodes there", func() {
+					images, err := regionalImages.List(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					homeIDs, remoteIDs := fipsImageIDs("202610.23.0"), fipsImageIDs("202610.30.1")
+					Expect(images).To(HaveLen(len(homeIDs) + len(remoteIDs)))
+					for _, image := range images {
+						region := image.Requirements.Get(v1.LabelTopologyRegion).Any()
+						Expect(lo.Ternary(region == fake.RegionNonZonal, remoteIDs, homeIDs)).To(ContainElement(image.ID), "only FIPS images, each at the newest version of its region")
+					}
+					nodeClass.Status.Images = lo.Map(images, func(image imagefamily.NodeImage, _ int) v1beta1.NodeImage {
+						return v1beta1.NodeImage{ID: image.ID, Requirements: lo.Map(image.Requirements.NodeSelectorRequirements(), func(r karpv1.NodeSelectorRequirementWithMinValues, _ int) v1.NodeSelectorRequirement {
+							return v1.NodeSelectorRequirement{Key: r.Key, Operator: r.Operator, Values: r.Values}
+						})}
+					})
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					vm := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+					Expect(lo.FromPtr(vm.Location)).To(Equal(fake.RegionNonZonal))
+					Expect(remoteIDs).To(ContainElement(lo.FromPtr(vm.Properties.StorageProfile.ImageReference.CommunityGalleryImageID)))
+					customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
+					Expect(err).ToNot(HaveOccurred())
+					Expect(string(customData)).To(ContainSubstring(v1beta1.AKSLabelFIPSEnabled + "=true"))
+				})
+				It("should name a region without a FIPS image instead of falling back to non-FIPS images", func() {
+					remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()
+					_, err := regionalImages.List(ctx, nodeClass)
+					var notFound *imagefamily.FIPSImagesNotFoundError
+					Expect(errors.As(err, &notFound)).To(BeTrue())
+					Expect(notFound.Location).To(Equal(fake.RegionNonZonal))
+					Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal)))
+				})
 			})
 			It("should keep a hydrated region when its refresh fails and fail stale quota open", func() {
 				start := fakeClock.Now()
