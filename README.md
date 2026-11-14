@@ -58,7 +58,8 @@ This fork adds opt-in `AKSNodeClass.spec.regions` using the existing provider an
 controller, not a second autoscaler or a new NodeClass kind. See
 [multi-region provisioning](docs/multi-region.md) for prerequisites, limitations,
 build instructions, and the dedicated-cluster acceptance test. This is **not**
-managed NAP or managed Azure CNI support.
+managed NAP or managed Azure CNI support. The feature stays off unless the
+controller runs with `--enable-multi-region` (`ENABLE_MULTI_REGION=true`).
 
 ## Node memory reservations
 
