@@ -388,8 +388,13 @@ func TestRegionalLaunchRequiresThePodNetworkStartupTaint(t *testing.T) {
 	vm := &Instances{VMProvider: home.Instances, Registry: registry, KubeClient: kube}
 	types, err := (&InstanceTypes{Provider: home.Types, Registry: registry}).List(ctx, testClass())
 	g.Expect(err).ToNot(HaveOccurred())
-	for _, taints := range [][]corev1.Taint{nil, {{Key: key, Effect: corev1.TaintEffectPreferNoSchedule}}, {{Key: "example.com/other", Effect: corev1.TaintEffectNoSchedule}}} {
-		claim.Spec.StartupTaints = taints
+	for _, spec := range []karpv1.NodeClaimSpec{
+		{},
+		{StartupTaints: []corev1.Taint{{Key: key, Effect: corev1.TaintEffectPreferNoSchedule}}},
+		{StartupTaints: []corev1.Taint{{Key: "example.com/other", Effect: corev1.TaintEffectNoSchedule}}},
+		{Taints: []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoSchedule}}},
+	} {
+		claim.Spec = spec
 		_, err = vm.BeginCreate(ctx, testClass(), claim, types)
 		g.Expect(err).To(MatchError(ContainSubstring(key)))
 	}
@@ -398,10 +403,15 @@ func TestRegionalLaunchRequiresThePodNetworkStartupTaint(t *testing.T) {
 	g.Expect(stored.Annotations).ToNot(HaveKey(PlacementAnnotation), "the check runs before any write")
 	g.Expect(home.Instances.(*testVMs).calls + remote.Instances.(*testVMs).calls).To(BeZero())
 
-	claim.Spec.StartupTaints = []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoSchedule}}
-	_, err = vm.BeginCreate(ctx, testClass(), claim, types)
-	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(remote.Instances.(*testVMs).calls).To(Equal(1))
+	for i, accepted := range []*karpv1.NodeClaim{
+		{ObjectMeta: metav1.ObjectMeta{Name: "no-schedule-claim", UID: "no-schedule-uid"}, Spec: karpv1.NodeClaimSpec{StartupTaints: []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoSchedule}}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "no-execute-claim", UID: "no-execute-uid"}, Spec: karpv1.NodeClaimSpec{StartupTaints: []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoExecute}}}},
+	} {
+		g.Expect(kube.Create(ctx, accepted)).To(Succeed())
+		_, err = vm.BeginCreate(ctx, testClass(), accepted, types)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(remote.Instances.(*testVMs).calls).To(Equal(i+1), accepted.Name)
+	}
 
 	homeClass := testClass()
 	homeClass.Spec.Regions = nil

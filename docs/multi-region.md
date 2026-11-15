@@ -17,7 +17,8 @@ network setups:
   connectivity across the configured regions.
 - Azure CNI Overlay (`NETWORK_PLUGIN=azure`, `NETWORK_PLUGIN_MODE=overlay`) with
   [`--multi-region-external-pod-network`](#azure-cni-overlay-with-an-external-pod-network),
-  where an agent outside this provider carries the pod traffic of regional nodes.
+  where a pod network agent, such as the one that the `karpenter` chart can run
+  (off by default), carries the pod traffic of regional nodes.
 
 Only Linux nodes are supported. Other managed Azure CNI configurations, both AKS
 Machine API dispatch modes, and the bootstrapping service path are rejected
@@ -54,16 +55,12 @@ Nodes opted into this feature are excluded from external load balancers, even
 when the selected region is the cluster region. Exposing workloads requires a
 separately validated ingress/service architecture.
 
-On Azure CNI Overlay with the [pod network agent](#pod-network-agent), Cilium
-forwards a request that a node receives for a LoadBalancer or NodePort Service
-with `externalTrafficPolicy: Cluster` to an endpoint on another node after
-translating the request's source to its own node IP. An endpoint on a regional
-node answers that node IP through the regional node's own interface, where
-Azure drops the answer, so such connections fail. Give these Services
-`externalTrafficPolicy: Local` with at least one endpoint on a home node, keep
-their endpoints off regional nodes, or reach them through an ingress
-controller. Clients inside the cluster, which Cilium load-balances at the
-socket, are not affected.
+On Azure CNI Overlay with the [pod network agent](#pod-network-agent), a request
+that a node receives for a LoadBalancer or NodePort Service with
+`externalTrafficPolicy: Cluster` fails when it is forwarded to an endpoint on a
+regional node. Give these Services `externalTrafficPolicy: Local` with at least
+one endpoint on a home node, keep their endpoints off regional nodes, or reach
+them through an ingress controller. Clients inside the cluster are not affected.
 
 ## Configuration
 
@@ -214,8 +211,10 @@ label in the template of a home NodePool.
 The `karpenter` chart can run a pod network agent, built from this repository
 for amd64 and arm64, that supplies the pod network of regional nodes on Azure
 CNI Overlay with the AKS-managed Cilium dataplane. It is off by default.
-`podNetworkAgent.enabled=true` runs it as a DaemonSet on every Linux node and
-needs `--multi-region-external-pod-network`, the cluster pod CIDR in
+`podNetworkAgent.enabled=true` runs it as a DaemonSet on every Linux node. The
+DaemonSet tolerates every taint, because the agent must run on a node that still
+carries the startup taint it removes. The agent needs
+`--multi-region-external-pod-network`, the cluster pod CIDR in
 `podNetworkAgent.podCIDR` and the ARM ID of the node resource group in
 `podNetworkAgent.nodeResourceGroupID`. The node subnets of the cluster and of
 every region must reach each other, with UDP 4789 allowed between them. In
@@ -225,10 +224,12 @@ kernel routes, and an exclusive Cilium renames other CNI files. The agent
 programs nothing on a node unless it can confirm both, nor on a node labelled
 `kubernetes.azure.com/ebpf-host-routing`.
 
-The agent never assigns pod ranges. A node's range is the `/24` in its Azure
+The agent never assigns pod ranges and does not read `Node.spec.podCIDRs`. A
+node's range is the `/24` in `status.networkContainers[].primaryIP` of its Azure
 CNI Overlay `NodeNetworkConfig` (`kube-system/<node name>`), accepted only while
-that object belongs to the Node's current UID and names its `InternalIP`, and
-the `/24` lies in the pod CIDR and overlaps no other node's range. The agent
+that object belongs to the Node's current UID and holds exactly one network
+container, of type `overlay`, whose `nodeIP` is the Node's `InternalIP`, and the
+`/24` lies in the pod CIDR and overlaps no other node's range. The agent
 pins each node's range, region, VM ID and IP in memory when it accepts them; a
 later change removes the node as a peer. A node is regional when it is
 registered, carries the `karpenter.azure.com/region-placement` annotation, and
@@ -245,18 +246,20 @@ of a bridge that holds the node's transit address as a `/32`: the node with the
 n-th `/24` of the pod CIDR, counting from 0, gets the n-th address of
 `podNetworkAgent.transitPrefix` (default `169.254.64.0/18`, enough for pod
 CIDRs up to `/10`), and its bridge gets the MAC address `02:00` followed by the
-four bytes of that address. For each peer the agent adds a permanent neighbour
+four bytes of that address. For each peer the agent adds a permanent neighbor
 entry, a static forwarding entry to the peer's node IP, a route to the peer's
 transit address, and a route to the peer's `/24` through that address with the
 node's own transit address as source, so nothing relies on ARP or flooding. A
-connection that a node itself opens to a pod on another node therefore carries
+connection that a node itself opens to a pod on a peer therefore carries
 the node's transit address, which Cilium treats as `world`: a NetworkPolicy
 that admits only cluster or node sources does not admit it. The agent accepts
 UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs into the
 tunnel. It does not start when the transit prefix is not inside
-`169.254.0.0/16`, is too small for the pod CIDR or contains `169.254.169.254`,
-when another VXLAN device uses UDP 4789, or when a host address that the agent
-did not assign lies in the transit prefix. A home node's peers are the regional
+`169.254.0.0/16`, has host bits, is too small for the pod CIDR or contains
+`169.254.169.254`. On every pass it changes nothing on the node while another
+VXLAN device uses UDP 4789, a device with one of its names is not its own, or a
+host address that it did not assign lies in the transit prefix; what it
+programmed before stays. A home node's peers are the regional
 nodes, and its CNI configuration stays as AKS wrote it. A regional node's peers
 are all other nodes, and there the agent also:
 
@@ -298,10 +301,10 @@ unless its `startupTaints` hold a `NoSchedule` or `NoExecute` taint with that
 key. The agent removes the taint from its own node once its checks pass, the
 CNI file is in place, the tunnel is programmed and the node's Cilium agent is
 healthy (`http://127.0.0.1:9879/healthz` with the header `brief: true`). It
-puts the taint back when any of that fails later, unless the Node is being
-deleted, and its readiness probe reports the same state. A regional node that
-never becomes ready stays tainted until its NodeClaim is deleted; this provider
-has no repair policy for it.
+puts the taint back when any of that fails later, only on the Node with the UID
+it checked and unless that Node is being deleted, and its readiness probe
+reports the same state. A regional node that never becomes ready stays tainted
+until its NodeClaim is deleted; this provider has no repair policy for it.
 
 The agent runs as root with host networking but unprivileged: only the
 `NET_ADMIN` capability, no privilege escalation, a read-only root file system
