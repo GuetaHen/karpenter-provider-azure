@@ -45,19 +45,32 @@ type Config struct {
 
 // Validate checks the configuration. The agent does not start unless it succeeds.
 func (c *Config) Validate() error {
-	if p := c.PodCIDR; !p.IsValid() || !p.Addr().Is4() || p.Bits() > 24 || p.Masked() != p {
-		return fmt.Errorf("the pod CIDR %s must be an IPv4 prefix of length 24 or less without host bits", p)
+	if err := c.validatePodCIDR(); err != nil {
+		return err
 	}
 	if err := c.validateTransit(); err != nil {
 		return err
 	}
 	id, err := arm.ParseResourceID(c.NodeResourceGroupID)
-	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/resourceGroups") {
-		return errors.New("the node resource group ID must be the ARM ID of a resource group")
+	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/resourceGroups") || id.SubscriptionID == "" {
+		return errors.New("the node resource group ID must be the ARM ID of a resource group in a subscription")
 	}
 	if errs := validation.IsDNS1123Subdomain(c.NodeClassGroup); len(errs) > 0 {
 		return fmt.Errorf("the node class group %q must be an API group: %s", c.NodeClassGroup, strings.Join(errs, "; "))
 	}
 	c.nodeResourceGroup = id
+	return nil
+}
+
+// validatePodCIDR checks the pod CIDR. It must not overlap IPv4 link-local space, so that no pod route
+// covers the instance metadata address or a transit address.
+func (c *Config) validatePodCIDR() error {
+	p := c.PodCIDR
+	if !p.IsValid() || !p.Addr().Is4() || p.Bits() > 24 || p.Masked() != p {
+		return fmt.Errorf("the pod CIDR %s must be an IPv4 prefix of length 24 or less without host bits", p)
+	}
+	if p.Overlaps(linkLocal) {
+		return fmt.Errorf("the pod CIDR %s must not overlap %s", p, linkLocal)
+	}
 	return nil
 }

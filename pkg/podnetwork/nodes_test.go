@@ -113,13 +113,15 @@ func TestConfigValidate(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(testConfig(t).nodeResourceGroup.ResourceGroupName).To(Equal("cluster-nodes"))
 	for name, change := range map[string]func(*Config){
-		"no pod CIDR":                func(c *Config) { c.PodCIDR = netip.Prefix{} },
-		"an IPv6 pod CIDR":           func(c *Config) { c.PodCIDR = netip.MustParsePrefix("fd00::/48") },
-		"a pod CIDR longer than /24": func(c *Config) { c.PodCIDR = netip.MustParsePrefix("10.244.0.0/25") },
-		"a pod CIDR with host bits":  func(c *Config) { c.PodCIDR = netip.MustParsePrefix("10.244.1.0/16") },
-		"no resource group":          func(c *Config) { c.NodeResourceGroupID = "" },
-		"a VM instead of a group":    func(c *Config) { c.NodeResourceGroupID += "/providers/Microsoft.Compute/virtualMachines/vm" },
-		"no node class group":        func(c *Config) { c.NodeClassGroup = "" },
+		"no pod CIDR":                           func(c *Config) { c.PodCIDR = netip.Prefix{} },
+		"an IPv6 pod CIDR":                      func(c *Config) { c.PodCIDR = netip.MustParsePrefix("fd00::/48") },
+		"a pod CIDR longer than /24":            func(c *Config) { c.PodCIDR = netip.MustParsePrefix("10.244.0.0/25") },
+		"a pod CIDR with host bits":             func(c *Config) { c.PodCIDR = netip.MustParsePrefix("10.244.1.0/16") },
+		"no resource group":                     func(c *Config) { c.NodeResourceGroupID = "" },
+		"a VM instead of a group":               func(c *Config) { c.NodeResourceGroupID += "/providers/Microsoft.Compute/virtualMachines/vm" },
+		"no node class group":                   func(c *Config) { c.NodeClassGroup = "" },
+		"a pod CIDR in link-local space":        func(c *Config) { c.PodCIDR = netip.MustParsePrefix("169.254.0.0/16") },
+		"a resource group without subscription": func(c *Config) { c.NodeResourceGroupID = "/providers/Microsoft.Resources/resourceGroups/cluster-nodes" },
 	} {
 		c := &Config{PodCIDR: netip.MustParsePrefix("10.244.0.0/16"), NodeResourceGroupID: testResourceGroupID, NodeClassGroup: testGroup,
 			TransitPrefix: netip.MustParsePrefix(DefaultTransitPrefix)}
@@ -136,6 +138,11 @@ func TestEvaluateAcceptsHomeAndRegionalNodes(t *testing.T) {
 	cl.add("home-2", "10.0.0.5", "10.244.2.0/24", "")
 	cl.add("regional-1", "10.1.0.4", "10.244.7.0/24", "westus2")
 	cl.add("regional-2", "10.2.0.4", "10.244.255.0/24", "centralus")
+	// A home node may run on a scale set, an ExternalIP does not count, and provider IDs compare
+	// ignoring case.
+	cl.nodes[1].Spec.ProviderID = "azure:///subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cluster-nodes/providers/Microsoft.Compute/virtualMachineScaleSets/home-vmss/virtualMachines/2"
+	cl.nodes[0].Status.Addresses = append(cl.nodes[0].Status.Addresses, corev1.NodeAddress{Type: corev1.NodeExternalIP, Address: "20.0.0.4"})
+	cl.claims[0].Status.ProviderID = strings.ToUpper(cl.claims[0].Status.ProviderID)
 	// A NodeClaim without a placement, of either installation, leaves its node a home node.
 	cl.claims = append(cl.claims, claimFor(&cl.nodes[0], testGroup, ""), claimFor(&cl.nodes[1], "karpenter.azure.com", ""))
 	eval := testConfig(t).Evaluate(cl.nodes, cl.configs, cl.claims)
@@ -166,6 +173,15 @@ func TestEvaluateRejectsNodesThatFailACheck(t *testing.T) {
 		"a provider ID in another resource group": {func(cl *cluster) {
 			cl.nodes[1].Spec.ProviderID = strings.Replace(cl.nodes[1].Spec.ProviderID, "CLUSTER-NODES", "other", 1)
 		}, "not in the node resource group"},
+		"a provider ID in another subscription": {func(cl *cluster) {
+			cl.nodes[1].Spec.ProviderID = strings.Replace(cl.nodes[1].Spec.ProviderID, "-000000000001/", "-000000000002/", 1)
+		}, "not in the node resource group"},
+		"a provider ID of the resource group": {func(cl *cluster) {
+			cl.nodes[1].Spec.ProviderID = "azure:///subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/CLUSTER-NODES"
+		}, "not a VM"},
+		"a provider ID of a network interface": {func(cl *cluster) {
+			cl.nodes[1].Spec.ProviderID = strings.Replace(cl.nodes[1].Spec.ProviderID, "Microsoft.Compute/virtualMachines", "Microsoft.Network/networkInterfaces", 1)
+		}, "not a VM"},
 		"two IPv4 InternalIPs": {func(cl *cluster) {
 			cl.nodes[1].Status.Addresses = append(cl.nodes[1].Status.Addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.1.0.5"})
 		}, "2 IPv4 InternalIPs instead of one"},
@@ -174,6 +190,9 @@ func TestEvaluateRejectsNodesThatFailACheck(t *testing.T) {
 		"the NodeNetworkConfig of a former Node": {func(cl *cluster) {
 			cl.configs[1].SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: "regional-1", UID: "former-uid"}})
 		}, "belongs to Node regional-1 with UID former-uid"},
+		"the NodeNetworkConfig of another Node with this UID": {func(cl *cluster) {
+			cl.configs[1].SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "v1", Kind: "Node", Name: "regional-2", UID: "regional-1-uid"}})
+		}, "belongs to Node regional-2 with UID regional-1-uid"},
 		"a NodeNetworkConfig without owner": {func(cl *cluster) { cl.configs[1].SetOwnerReferences(nil) }, "has no Node owner"},
 		"another node IP": {func(cl *cluster) {
 			setContainers(&cl.configs[1], container("10.244.7.0/24", "10.1.0.9", "overlay"))

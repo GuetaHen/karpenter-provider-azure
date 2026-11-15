@@ -20,7 +20,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	. "github.com/onsi/gomega"
 )
@@ -33,7 +36,7 @@ const testMetadata = `{"compute": {"vmId": "0A1B2C3D-0000-0000-0000-000000000001
 func metadataClient(t *testing.T, status int, body string) *MetadataClient {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Metadata") != "true" || r.URL.Path != "/metadata/instance" || r.URL.Query().Get("api-version") == "" {
+		if r.Header.Get("Metadata") != "true" || r.URL.Path != "/metadata/instance" || r.URL.RawQuery != "api-version=2021-02-01" {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -55,12 +58,18 @@ func TestMetadataClientReadsTheLocalVM(t *testing.T) {
 		ResourceGroupName: "Cluster-Nodes",
 		PrivateIP:         netip.MustParseAddr("10.1.0.4"),
 	}))
-	for _, bad := range []struct {
+	oversized := strings.Replace(testMetadata, `"name": "regional-1"`, `"name": "`+strings.Repeat("x", 1<<20)+`"`, 1)
+	for name, bad := range map[string]struct {
 		status int
 		body   string
-	}{{http.StatusInternalServerError, testMetadata}, {http.StatusOK, "{"}, {http.StatusOK, `{"compute": {"vmId": "x"}}`}} {
+	}{
+		"a server error":                 {http.StatusInternalServerError, testMetadata},
+		"broken JSON":                    {http.StatusOK, "{"},
+		"no network interface":           {http.StatusOK, `{"compute": {"vmId": "x"}}`},
+		"a body over the limit of 1 MiB": {http.StatusOK, oversized},
+	} {
 		_, err := metadataClient(t, bad.status, bad.body).Get(t.Context())
-		g.Expect(err).To(HaveOccurred(), "status %d, body %s", bad.status, bad.body)
+		g.Expect(err).To(HaveOccurred(), name)
 	}
 
 	client := NewMetadataClient()
@@ -68,22 +77,46 @@ func TestMetadataClientReadsTheLocalVM(t *testing.T) {
 	transport, ok := client.HTTP.Transport.(*http.Transport)
 	g.Expect(ok).To(BeTrue())
 	g.Expect(transport.Proxy).To(BeNil(), "instance metadata is never read through a proxy")
+	g.Expect(client.HTTP.Timeout).To(Equal(10*time.Second), "a request that hangs does not stall the agent")
+}
+
+func TestMetadataClientFollowsNoRedirect(t *testing.T) {
+	g := NewWithT(t)
+	var followed atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/elsewhere" {
+			followed.Store(true)
+			_, _ = w.Write([]byte(testMetadata))
+			return
+		}
+		http.Redirect(w, r, "/elsewhere", http.StatusFound)
+	}))
+	t.Cleanup(server.Close)
+	client := NewMetadataClient()
+	client.Endpoint = server.URL
+	_, err := client.Get(t.Context())
+	g.Expect(err).To(MatchError(ContainSubstring("302")))
+	g.Expect(followed.Load()).To(BeFalse())
 }
 
 func TestCheckSelf(t *testing.T) {
 	g := NewWithT(t)
 	c := testConfig(t)
-	own := Node{Name: "regional-1", Role: Regional, Region: "westus2", VMID: "0a1b2c3d-0000-0000-0000-000000000001", IP: netip.MustParseAddr("10.1.0.4")}
-	md := InstanceMetadata{VMID: "0A1B2C3D-0000-0000-0000-000000000001", Location: "westus2", SubscriptionID: "00000000-0000-0000-0000-000000000001",
+	own := Node{Name: "regional-1", Role: Regional, Region: "westus2", VMID: "0a1b2c3d-4e5f-6a7b-8c9d-000000000001", IP: netip.MustParseAddr("10.1.0.4")}
+	md := InstanceMetadata{VMID: "0A1B2C3D-4E5F-6A7B-8C9D-000000000001", Location: "westus2", SubscriptionID: "00000000-0000-0000-0000-000000000001",
 		ResourceGroupName: "Cluster-Nodes", PrivateIP: netip.MustParseAddr("10.1.0.4")}
 	g.Expect(c.CheckSelf(own, md)).To(Succeed(), "the VM ID and the resource group compare ignoring case")
+	generation1 := md
+	generation1.VMID = "3D2C1B0A-5F4E-7B6A-8C9D-000000000001"
+	g.Expect(c.CheckSelf(own, generation1)).To(Succeed(), "a Generation 1 VM reports the first three groups byte-swapped")
 	for name, change := range map[string]func(*InstanceMetadata){
-		"another VM ID":          func(m *InstanceMetadata) { m.VMID = "0a1b2c3d-0000-0000-0000-000000000002" },
-		"the byte-swapped VM ID": func(m *InstanceMetadata) { m.VMID = "3D2C1B0A-0000-0000-0000-000000000001" },
-		"another private IP":     func(m *InstanceMetadata) { m.PrivateIP = netip.MustParseAddr("10.1.0.5") },
-		"another subscription":   func(m *InstanceMetadata) { m.SubscriptionID = "00000000-0000-0000-0000-000000000002" },
-		"another resource group": func(m *InstanceMetadata) { m.ResourceGroupName = "other" },
-		"another location":       func(m *InstanceMetadata) { m.Location = "eastus2" },
+		"another VM ID":                     func(m *InstanceMetadata) { m.VMID = "0a1b2c3d-4e5f-6a7b-8c9d-000000000002" },
+		"only the first group byte-swapped": func(m *InstanceMetadata) { m.VMID = "3d2c1b0a-4e5f-6a7b-8c9d-000000000001" },
+		"the fourth group byte-swapped too": func(m *InstanceMetadata) { m.VMID = "3d2c1b0a-5f4e-7b6a-9d8c-000000000001" },
+		"another private IP":                func(m *InstanceMetadata) { m.PrivateIP = netip.MustParseAddr("10.1.0.5") },
+		"another subscription":              func(m *InstanceMetadata) { m.SubscriptionID = "00000000-0000-0000-0000-000000000002" },
+		"another resource group":            func(m *InstanceMetadata) { m.ResourceGroupName = "other" },
+		"another location":                  func(m *InstanceMetadata) { m.Location = "eastus2" },
 	} {
 		changed := md
 		change(&changed)

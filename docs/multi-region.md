@@ -236,9 +236,10 @@ registered, carries the `karpenter.azure.com/region-placement` annotation, and
 exactly one NodeClaim of this controller's node class group has its provider ID
 and a placement that matches the VM's location and the node's region label.
 Before it programs its own node, the agent also requires instance metadata to
-report the Node's `systemUUID` as VM ID, ignoring case, its `InternalIP` as
-private IP, and the subscription and resource group of both
-`podNetworkAgent.nodeResourceGroupID` and the Node's provider ID.
+report the Node's `systemUUID` as VM ID, ignoring case and either as it is or
+with its first three groups byte-swapped, as Linux reports it on Generation 1
+VMs, its `InternalIP` as private IP, and the subscription and resource group of
+both `podNetworkAgent.nodeResourceGroupID` and the Node's provider ID.
 
 On every node the agent programs a VXLAN tunnel on UDP 4789 with MTU 1400,
 whose VNI derives from the node resource group ID. The VXLAN device is a port
@@ -254,14 +255,14 @@ connection that a node itself opens to a pod on a peer therefore carries
 the node's transit address, which Cilium treats as `world`: a NetworkPolicy
 that admits only cluster or node sources does not admit it. The agent accepts
 UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs into the
-tunnel. It does not start when the transit prefix is not inside
-`169.254.0.0/16`, has host bits, is too small for the pod CIDR or contains
-`169.254.169.254`. On every pass it changes nothing on the node while another
-VXLAN device uses UDP 4789, a device with one of its names is not its own, or a
-host address that it did not assign lies in the transit prefix; what it
-programmed before stays. A home node's peers are the regional
-nodes, and its CNI configuration stays as AKS wrote it. A regional node's peers
-are all other nodes, and there the agent also:
+tunnel. It does not start when the pod CIDR overlaps `169.254.0.0/16`, or when
+the transit prefix is not inside `169.254.0.0/16`, has host bits, is too small
+for the pod CIDR or contains `169.254.169.254`. On every pass it changes nothing
+on the node while another VXLAN device uses UDP 4789, a device with one of its
+names is not its own, or a host address that it did not assign lies in the
+transit prefix; what it programmed before stays. A home node's peers are the
+regional nodes, and its CNI configuration stays as AKS wrote it. A regional
+node's peers are all other nodes, and there the agent also:
 
 - writes, once, a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the

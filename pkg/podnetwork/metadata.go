@@ -46,11 +46,18 @@ type MetadataClient struct {
 }
 
 // NewMetadataClient returns a client of the Instance Metadata Service of the local VM. It uses no
-// proxy, because the service answers only requests that come straight from the VM.
+// proxy, because the service answers only requests that come straight from the VM, and it follows
+// no redirect, so that it reads instance metadata from nowhere else.
 func NewMetadataClient() *MetadataClient {
 	return &MetadataClient{
 		Endpoint: "http://169.254.169.254",
-		HTTP:     &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{Proxy: nil}},
+		HTTP: &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: &http.Transport{Proxy: nil},
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
@@ -105,12 +112,12 @@ func (m *MetadataClient) Get(ctx context.Context) (InstanceMetadata, error) {
 }
 
 // CheckSelf verifies, before the agent programs anything for its own node, that instance metadata
-// describes the VM of that node: the VM ID is the Node's systemUUID, ignoring case and with no
-// byte-swapped form, the private IP is its InternalIP, and the VM is in the node resource group and
-// in the node's region.
+// describes the VM of that node: the VM ID is the Node's systemUUID, ignoring case, as it is or in
+// the byte-swapped form of a Generation 1 VM; the private IP is its InternalIP; and the VM is in the
+// node resource group and in the node's region.
 func (c *Config) CheckSelf(own Node, md InstanceMetadata) error {
 	switch {
-	case !strings.EqualFold(md.VMID, own.VMID):
+	case !sameVM(md.VMID, own.VMID):
 		return errors.New("instance metadata reports another VM ID than the Node's systemUUID")
 	case md.PrivateIP != own.IP:
 		return fmt.Errorf("instance metadata reports private IP %s, not the InternalIP %s", md.PrivateIP, own.IP)
@@ -121,4 +128,28 @@ func (c *Config) CheckSelf(own Node, md InstanceMetadata) error {
 		return fmt.Errorf("instance metadata reports location %s, not the region %s of the node", md.Location, own.Region)
 	}
 	return nil
+}
+
+// sameVM reports whether the VM ID from instance metadata is the systemUUID of a Node, ignoring
+// case. On a Generation 1 VM, Linux reports the system UUID with the bytes of each of its first
+// three groups in reverse order against the VM ID, so that form matches too.
+func sameVM(vmID, systemUUID string) bool {
+	return strings.EqualFold(vmID, systemUUID) || strings.EqualFold(swapUUIDGroups(vmID), systemUUID)
+}
+
+// swapUUIDGroups reverses the order of the bytes, the pairs of hex digits, in each of the first
+// three groups of a UUID in its 8-4-4-4-12 form. It returns anything else unchanged.
+func swapUUIDGroups(s string) string {
+	groups := strings.Split(s, "-")
+	if len(groups) != 5 || len(groups[0]) != 8 || len(groups[1]) != 4 || len(groups[2]) != 4 {
+		return s
+	}
+	for i := range 3 {
+		b := []byte(groups[i])
+		for l, r := 0, len(b)-2; l < r; l, r = l+2, r-2 {
+			b[l], b[l+1], b[r], b[r+1] = b[r], b[r+1], b[l], b[l+1]
+		}
+		groups[i] = string(b)
+	}
+	return strings.Join(groups, "-")
 }

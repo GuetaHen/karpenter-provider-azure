@@ -81,19 +81,22 @@ type Evaluation struct {
 }
 
 // Evaluate checks every node against its NodeNetworkConfig and the NodeClaims with its provider
-// ID. A node is also rejected while another NodeNetworkConfig names its pod range.
+// ID, which it compares ignoring case. A node is also rejected while another NodeNetworkConfig
+// names its pod range, if that one is well-formed: its only network container is of type overlay
+// and names a /24 of the pod CIDR. A malformed NodeNetworkConfig gives its own node no pod range
+// and rejects no other node.
 func (c *Config) Evaluate(nodes []corev1.Node, networkConfigs []unstructured.Unstructured, nodeClaims []karpv1.NodeClaim) Evaluation {
 	configs, rangeOwners := c.indexNetworkConfigs(networkConfigs)
 	claims := map[string][]*karpv1.NodeClaim{}
 	for i := range nodeClaims {
-		if id := nodeClaims[i].Status.ProviderID; id != "" {
+		if id := strings.ToLower(nodeClaims[i].Status.ProviderID); id != "" {
 			claims[id] = append(claims[id], &nodeClaims[i])
 		}
 	}
 	eval := Evaluation{Accepted: map[string]Node{}, Rejected: map[string]string{}}
 	for i := range nodes {
 		node := &nodes[i]
-		n, err := c.check(node, configs[node.Name], claims[node.Spec.ProviderID])
+		n, err := c.check(node, configs[node.Name], claims[strings.ToLower(node.Spec.ProviderID)])
 		if err == nil {
 			err = sharedRange(n, rangeOwners[n.PodRange])
 		}
@@ -186,7 +189,8 @@ func (c *Config) identity(node *corev1.Node) (Node, error) {
 	return n, err
 }
 
-// checkProviderID requires an Azure provider ID in the node resource group.
+// checkProviderID requires an Azure provider ID that names a VM, standalone or of a scale set, in the
+// node resource group.
 func (c *Config) checkProviderID(providerID string) error {
 	raw, ok := strings.CutPrefix(providerID, "azure://")
 	if !ok {
@@ -196,6 +200,10 @@ func (c *Config) checkProviderID(providerID string) error {
 	if err != nil || !strings.EqualFold(id.SubscriptionID, c.nodeResourceGroup.SubscriptionID) ||
 		!strings.EqualFold(id.ResourceGroupName, c.nodeResourceGroup.ResourceGroupName) {
 		return errors.New("the provider ID is not in the node resource group")
+	}
+	if t := id.ResourceType.String(); !strings.EqualFold(t, "Microsoft.Compute/virtualMachines") &&
+		!strings.EqualFold(t, "Microsoft.Compute/virtualMachineScaleSets/virtualMachines") {
+		return fmt.Errorf("the provider ID names a resource of type %s, not a VM", t)
 	}
 	return nil
 }
@@ -291,9 +299,10 @@ func (c *Config) podRange(primaryIP string) (netip.Prefix, uint32, error) {
 }
 
 // role tells a home node from a regional one. A node is regional when it, or a NodeClaim with its
-// provider ID, carries the placement annotation. The agent accepts a regional node once Karpenter
-// has registered it and exactly one NodeClaim, of the configured node class group, has its provider
-// ID and a placement in the node's region. The region label of a node names the location of its VM;
+// provider ID, carries the placement annotation, so a node without the annotation counts as home
+// until a NodeClaim carries its provider ID. The agent accepts a regional node once Karpenter has
+// registered it and exactly one NodeClaim, of the configured node class group, has its provider ID
+// and a placement in the node's region. The region label of a node names the location of its VM;
 // the agent checks the location of its own VM against instance metadata.
 func (c *Config) role(node *corev1.Node, claims []*karpv1.NodeClaim, region string) (Role, error) {
 	_, annotated := node.Annotations[PlacementAnnotation]
