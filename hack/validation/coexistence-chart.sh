@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Validates that the charts install coexistence mode by values and --skip-crds:
-# - the karpenter-coexistence-crd chart renders only the multiregion.io AKSNodeClass
-#   CRD, which Helm keeps when its release is uninstalled, and the karpenter-crd
-#   chart renders every other CRD;
+# - the karpenter-coexistence-crd chart holds no symbolic link and renders only
+#   the multiregion.io AKSNodeClass CRD, which Helm keeps when its release is
+#   uninstalled, and the karpenter-crd chart renders every other CRD;
 # - the controller chart refuses coexistence mode with the webhooks enabled, sets
 #   COEXISTENCE_MODE, grants access to multiregion.io AKSNodeClasses plus get on
 #   karpenter.azure.com AKSNodeClasses instead of access to the latter, and grants
@@ -44,6 +44,11 @@ maintenance_window_access() {
         | any($objects[]; .kind == "RoleBinding" and (.roleRef.name as $name | any($roles[]; . == $name)))' >/dev/null
 }
 
+# Go module archives omit symbolic links, so this chart must not hold any.
+[[ -z "$(find charts/karpenter-coexistence-crd -type l)" ]] || {
+    echo "expected no symbolic links in charts/karpenter-coexistence-crd"
+    exit 1
+}
 helm lint charts/karpenter-coexistence-crd >"$tmp_dir/lint.txt" || {
     cat "$tmp_dir/lint.txt"
     exit 1
