@@ -87,6 +87,14 @@ var _ = Describe("Multi-region overlay and identity options", func() {
 		Expect(opts.ValidateHomeLocation("WestUS2")).To(MatchError(ContainSubstring("cluster region")))
 	})
 
+	It("keeps every identity of the global list and of a regional entry", func() {
+		opts := &options.Options{EnableMultiRegion: true, NodeIdentities: []string{identityID("global"), identityID("addon")}, KubeletIdentityClientID: "61f71907-753f-4802-a901-47361c3664f2"}
+		opts.SetMultiRegionNodeIdentitiesJSON(`{"westus2": {"nodeIdentities": ["` + identityID("west") + `", "` + identityID("addon") + `"], "kubeletIdentityClientID": "` + regionalClientID + `"}}`)
+		Expect(opts.ValidateMultiRegionOptions()).To(Succeed())
+		Expect(opts.NodeIdentitiesFor("westus2")).To(Equal([]string{identityID("west"), identityID("addon")}))
+		Expect(opts.NodeIdentitiesFor("eastus")).To(Equal([]string{identityID("global"), identityID("addon")}))
+	})
+
 	DescribeTable("rejects malformed regional identities",
 		func(raw, message string) {
 			opts := &options.Options{EnableMultiRegion: true}
