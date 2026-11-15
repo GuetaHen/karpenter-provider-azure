@@ -18,11 +18,13 @@ package coexistencesuite_test
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +34,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -58,15 +61,20 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/cloudprovider"
 	cloudproviderevents "github.com/Azure/karpenter-provider-azure/pkg/cloudprovider/events"
+	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/inplaceupdate"
 	nodeclasshash "github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/hash"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/termination"
+	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/regional"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
+	azureexpectations "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
@@ -401,5 +409,71 @@ var _ = Describe("Coexistence mode", func() {
 		Expect(instance.GetVMListQueryBuilder(testOptions.NodeResourceGroup).String()).To(Equal(vmPrefix + owned + noMachines))
 		Expect(instance.GetNICListQueryBuilder(testOptions.NodeResourceGroup, false).String()).To(Equal(nicPrefix + owned + noMachines))
 		Expect(instance.GetNICListQueryBuilder(testOptions.NodeResourceGroup, true).String()).To(Equal(nicPrefix + owned))
+	})
+
+	It("gives a NodeClass without regions ordinary home nodes while regional pools use an external pod network", func() {
+		multiRegion, externalPodNetwork := testOptions.EnableMultiRegion, testOptions.MultiRegionExternalPodNetwork
+		plugin, pluginMode, dataplane := testOptions.NetworkPlugin, testOptions.NetworkPluginMode, testOptions.NetworkDataplane
+		DeferCleanup(func() {
+			testOptions.EnableMultiRegion, testOptions.MultiRegionExternalPodNetwork = multiRegion, externalPodNetwork
+			testOptions.NetworkPlugin, testOptions.NetworkPluginMode, testOptions.NetworkDataplane = plugin, pluginMode, dataplane
+		})
+		testOptions.EnableMultiRegion, testOptions.MultiRegionExternalPodNetwork = true, true
+		testOptions.NetworkPlugin, testOptions.NetworkPluginMode = consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay
+		testOptions.NetworkDataplane = consts.NetworkDataplaneCilium
+		// The operator wraps the providers like this whenever multi-region provisioning is enabled.
+		var regionCalls atomic.Int32
+		registry := regional.New(fake.Region, &regional.Providers{
+			Types: azureEnv.InstanceTypesProvider, Images: azureEnv.ImageProvider, Instances: azureEnv.VMInstanceProvider, Quota: azureEnv.QuotaProvider,
+		}, func(string) *regional.Providers {
+			regionCalls.Add(1)
+			return nil
+		}, func(context.Context, v1beta1.Region) error {
+			regionCalls.Add(1)
+			return nil
+		})
+		homeProvider := cloudprovider.New(&regional.InstanceTypes{Provider: azureEnv.InstanceTypesProvider, Registry: registry},
+			&regional.Instances{VMProvider: azureEnv.VMInstanceProvider, Registry: registry, KubeClient: env.Client},
+			azureEnv.AKSMachineProvider, events.NewRecorder(recorder), env.Client,
+			&regional.Images{NodeImageProvider: azureEnv.ImageProvider, Registry: registry}, azureEnv.InstanceTypeStore, false)
+		DeferCleanup(homeProvider.WaitForInstancePromises)
+		for _, lb := range []armnetwork.LoadBalancer{
+			test.MakeStandardLoadBalancer(testOptions.NodeResourceGroup, loadbalancer.SLBName, true),
+			test.MakeStandardLoadBalancer(testOptions.NodeResourceGroup, loadbalancer.InternalSLBName, false),
+		} {
+			azureEnv.LoadBalancersAPI.LoadBalancers.Store(lo.FromPtr(lb.ID), lb)
+		}
+		nodeClass.Spec.VNETSubnetID = nil
+		test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
+		nodePool := nodePoolFor(ownRef(nodeClass))
+		claim := coretest.NodeClaim(karpv1.NodeClaim{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{karpv1.NodePoolLabelKey: nodePool.Name}},
+			Spec:       karpv1.NodeClaimSpec{NodeClassRef: ownRef(nodeClass)},
+		})
+		ExpectApplied(ctx, env.Client, nodeClass, nodePool, claim)
+
+		created, err := azureexpectations.CreateAndWaitForPromises(ctx, homeProvider, azureEnv, claim)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(regionCalls.Load()).To(BeZero(), "a NodeClass without regions never loads or validates a region")
+		Expect(created.Labels).ToNot(HaveKey(corev1.LabelNodeExcludeBalancers))
+		Expect(ExpectExists(ctx, env.Client, claim).Annotations).ToNot(HaveKey(regional.PlacementAnnotation))
+		input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+		Expect(lo.FromPtr(input.VM.Location)).To(Equal(fake.Region))
+		customData := string(lo.Must(base64.StdEncoding.DecodeString(lo.FromPtr(input.VM.Properties.OSProfile.CustomData))))
+		for _, label := range []string{
+			"kubernetes.azure.com/network-subnet=aks-subnet",
+			"kubernetes.azure.com/nodenetwork-vnetguid=" + testOptions.VnetGUID,
+			"kubernetes.azure.com/azure-cni-overlay=true",
+			"kubernetes.azure.com/podnetwork-type=overlay",
+		} {
+			Expect(customData).To(ContainSubstring(label))
+		}
+		Expect(customData).ToNot(ContainSubstring(corev1.LabelNodeExcludeBalancers))
+		nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+		Expect(err).ToNot(HaveOccurred())
+		for _, config := range nic.Properties.IPConfigurations {
+			Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(testOptions.SubnetID))
+			Expect(config.Properties.LoadBalancerBackendAddressPools).ToNot(BeEmpty(), "home nodes join the cluster load balancers")
+		}
 	})
 })

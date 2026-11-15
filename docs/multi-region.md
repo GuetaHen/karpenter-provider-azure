@@ -186,6 +186,17 @@ Overlay pod ranges belong to the cluster VNet, so a regional node pairs the
 cluster's `VNET_GUID` in `kubernetes.azure.com/nodenetwork-vnetguid` with the
 name of the subnet its NIC is in.
 
+The opt-in changes nothing for a NodeClass without `regions`, in coexistence
+mode too. Its nodes are ordinary nodes of the cluster region: on `vnetSubnetID`
+or the cluster subnet, in the cluster's load-balancer backend pools, with the
+cluster's network security group, route table and AKS-managed pod network.
+An agent that supplies the pod network of regional nodes tells them apart by
+`node.kubernetes.io/exclude-from-external-load-balancers=true`, which this
+provider sets on every node of a NodeClass with `regions` and on no other node,
+or by the `karpenter.azure.com/region-placement` annotation, which such a
+NodeClaim carries from launch and its Node from registration. Do not set that
+label in the template of a home NodePool.
+
 ### Per-region node identities
 
 Where an identity may only be attached to VMs in some regions,
