@@ -76,7 +76,12 @@ rules:
     resources: ["nodeclaims", "nodeclaims/status"]
     verbs: ["create", "delete", "update", "patch"]
   - apiGroups: ["karpenter.sh"]
+    {{- if include "karpenter.coexistence" . }}
+    # Coexistence mode applies NodeOverlays without writing their status.
+    resources: ["nodepools", "nodepools/status"]
+    {{- else }}
     resources: ["nodepools", "nodepools/status", "nodeoverlays/status"]
+    {{- end }}
     verbs: ["update", "patch"]
   {{- if dig "capacityBuffer" false .Values.settings.featureGates }}
   - apiGroups: ["autoscaling.x-k8s.io"]

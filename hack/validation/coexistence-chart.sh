@@ -6,8 +6,9 @@ set -euo pipefail
 #   CRD, which Helm keeps when its release is uninstalled, and the karpenter-crd
 #   chart renders every other CRD;
 # - the controller chart refuses coexistence mode with the webhooks enabled, sets
-#   COEXISTENCE_MODE, and grants access to multiregion.io AKSNodeClasses plus get on
-#   karpenter.azure.com AKSNodeClasses instead of access to the latter; and
+#   COEXISTENCE_MODE, grants access to multiregion.io AKSNodeClasses plus get on
+#   karpenter.azure.com AKSNodeClasses instead of access to the latter, and grants
+#   no write on NodeOverlay status, which only the default render keeps; and
 # - the controller may get the maintenance-window ConfigMap in the namespace that
 #   SYSTEM_NAMESPACE names.
 
@@ -25,6 +26,15 @@ env_value() {
 }
 nodeclass_rules() {
     yq eval-all -o=json 'select(.kind == "ClusterRole" and .metadata.name == "karpenter") | .rules' "$1"
+}
+# Counts the rules of ClusterRoles bound to the controller that let it write NodeOverlay status.
+overlay_status_writers() {
+    yq eval-all -o=json 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' "$1" | jq -s '
+        [.[] | select(.kind == "ClusterRoleBinding" and any((.subjects // [])[]; .kind == "ServiceAccount" and .name == "karpenter")) | .roleRef.name] as $bound
+        | [.[] | select(.kind == "ClusterRole" and (.metadata.name as $name | any($bound[]; . == $name))) | (.rules // [])[]
+            | select(any((.apiGroups // [])[]; . == "karpenter.sh" or . == "*")
+                and any((.resources // [])[]; . == "nodeoverlays/status" or . == "*")
+                and any((.verbs // [])[]; . == "update" or . == "patch" or . == "*"))] | length'
 }
 # Succeeds when a RoleBinding in namespace $2 binds a Role there that may get the ConfigMap.
 maintenance_window_access() {
@@ -74,6 +84,10 @@ jq -e '. == [
     {"apiGroups": ["karpenter.azure.com"], "resources": ["aksnodeclasses"], "verbs": ["get"]},
     {"apiGroups": ["multiregion.io"], "resources": ["aksnodeclasses", "aksnodeclasses/status"], "verbs": ["patch", "update"]}
 ]' <<<"$(nodeclass_rules "$tmp_dir/coexistence.yaml")" >/dev/null
+[[ "$(overlay_status_writers "$tmp_dir/default.yaml")" == 1 && "$(overlay_status_writers "$tmp_dir/coexistence.yaml")" == 0 ]] || {
+    echo "expected update and patch on nodeoverlays/status by default only, because coexistence mode never writes NodeOverlay status"
+    exit 1
+}
 maintenance_window_access "$tmp_dir/default.yaml" karpenter || {
     echo "expected get on the maintenance-window ConfigMap in the release namespace by default"
     exit 1

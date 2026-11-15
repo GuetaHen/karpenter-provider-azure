@@ -437,9 +437,10 @@ selector, so that only one installation can place each pod.
 Beyond the default rules, coexistence mode needs these Kubernetes permissions:
 `get`, `list`, `watch`, `patch` and `update` on `aksnodeclasses.multiregion.io`,
 `patch` and `update` on its `status`, and `get` on
-`aksnodeclasses.karpenter.azure.com`. It needs no permission on CRDs and no write
-on `karpenter.azure.com` AKSNodeClasses. The Helm charts install coexistence
-mode by values and `--skip-crds`:
+`aksnodeclasses.karpenter.azure.com`. It needs no permission on CRDs, no write
+on `karpenter.azure.com` AKSNodeClasses and no write on `nodeoverlays/status`,
+and the chart grants none of these in coexistence mode. The Helm charts install
+coexistence mode by values and `--skip-crds`:
 
 1. Install or upgrade the `karpenter-coexistence-crd` chart. It holds only the
    `multiregion.io` CRD, which Helm applies on install and on every upgrade.
