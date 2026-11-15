@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -270,22 +271,43 @@ func keptImagesThroughFIPSImagesNotFound(nodeClass *v1beta1.AKSNodeClass) bool {
 // that the NodeClass still selects but that the listing skipped in a region it listed, so that nodes on it keep their
 // image until the definition is listed again; the maintenance window then governs its update like any other. The image
 // of a definition that the NodeClass no longer selects, or of a region that the listing no longer covers, is not kept.
+// A kept image takes the place that the listing gives its definition among the images of its region, since the order
+// of Status.Images is the priority in which images are chosen for new nodes.
 func keepSkippedFIPSImages(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, goalImages []v1beta1.NodeImage) ([]v1beta1.NodeImage, error) {
 	selected, err := imagefamily.CommunityGalleryFIPSImageBases(ctx, nodeClass)
 	if err != nil || len(selected) == 0 {
 		return goalImages, err
 	}
+	priority := func(image v1beta1.NodeImage) int { return lo.IndexOf(selected, trimVersionSuffix(image.ID)) }
 	listed, regions := map[string]bool{}, map[string]bool{}
 	for _, image := range goalImages {
 		listed[imageBaseKey(image)] = true
 		regions[imageRegions(image)] = true
 	}
 	for _, image := range nodeClass.Status.Images {
-		if !listed[imageBaseKey(image)] && regions[imageRegions(image)] && lo.Contains(selected, trimVersionSuffix(image.ID)) {
-			goalImages = append(goalImages, image)
+		if listed[imageBaseKey(image)] || !regions[imageRegions(image)] || priority(image) < 0 {
+			continue
 		}
+		goalImages = slices.Insert(goalImages, priorityPosition(goalImages, image, priority), image)
+		listed[imageBaseKey(image)] = true
 	}
 	return goalImages, nil
+}
+
+// priorityPosition returns the index in images at which image keeps the priority order among the images of its region:
+// before the first of them that priority ranks after image, or else after the last of them.
+func priorityPosition(images []v1beta1.NodeImage, image v1beta1.NodeImage, priority func(v1beta1.NodeImage) int) int {
+	position := len(images)
+	for i := range images {
+		if imageRegions(images[i]) != imageRegions(image) {
+			continue
+		}
+		if priority(images[i]) > priority(image) {
+			return i
+		}
+		position = i + 1
+	}
+	return position
 }
 
 // Handles case 4: check if the maintenance window is open

@@ -227,11 +227,14 @@ community images are resolved:
   restrict `kubernetes.io/arch` and `karpenter.azure.com/sku-hyperv-generation`
   in the NodePool if that matters. A listing that skipped a definition is
   cached for five minutes instead of three days.
-- A definition that a region stops listing keeps its image there until it is
-  listed again, so nodes on it do not drift and new nodes still get it; then
-  the maintenance window governs its update like any other. The image is not
-  kept once the NodeClass no longer selects the definition (for example after
-  an image family change), once the region leaves `regions`, or during a
+- A definition that a region stops listing keeps its image there, at its
+  place in the image priority order, until it is listed again. Nodes on it do
+  not drift, and new nodes get it as before: while the Gen2 definition is
+  skipped, a size that supports both Hyper-V generations still gets the Gen2
+  image, not the Gen1 image. Then the maintenance window governs its update
+  like any other. The image is not kept once the NodeClass no longer selects
+  the definition (for example after an image family change), once the region
+  leaves `regions`, or during a
   pending update (a new NodeClass, a Kubernetes upgrade); the definition then
   returns at its newest version. A definition withdrawn from a region for good
   keeps its last image there until one of these happens, and launches that

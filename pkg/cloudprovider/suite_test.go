@@ -695,6 +695,20 @@ var _ = Describe("CloudProvider", func() {
 				communityVersion := func(name string, published time.Time) *armcompute.CommunityGalleryImageVersion {
 					return &armcompute.CommunityGalleryImageVersion{Name: lo.ToPtr(name), Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(published)}}
 				}
+				// reconcileImagesOutsideWindow reconciles the images of the NodeClass while the node OS maintenance window is
+				// closed, listing the remote region again.
+				reconcileImagesOutsideWindow := func() {
+					GinkgoHelper()
+					remote.NodeImagesCache.Flush()
+					_, err := status.NewNodeImageReconciler(regionalImages, kubernetesfake.NewClientset(&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
+						Data: map[string]string{
+							"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339),
+							"aksManagedNodeOSUpgradeSchedule-end":   time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+						},
+					}), "kube-system").Reconcile(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+				}
 				BeforeEach(func() {
 					testOptions.CommunityGalleryFIPSImages = true
 					nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.AzureLinuxImageFamily)
@@ -765,26 +779,13 @@ var _ = Describe("CloudProvider", func() {
 						}
 					}
 				})
-				It("should keep the FIPS images in use, without drift, while a region's image definitions return one at a time outside the maintenance window", func() {
-					reconciler := status.NewNodeImageReconciler(regionalImages, kubernetesfake.NewClientset(&v1.ConfigMap{
-						ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
-						Data: map[string]string{
-							"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339),
-							"aksManagedNodeOSUpgradeSchedule-end":   time.Now().Add(2 * time.Hour).Format(time.RFC3339),
-						},
-					}), "kube-system")
-					reconcileImages := func() {
-						GinkgoHelper()
-						remote.NodeImagesCache.Flush()
-						_, err := reconciler.Reconcile(ctx, nodeClass)
-						Expect(err).ToNot(HaveOccurred())
-					}
-					reconcileImages()
+				It("should keep the FIPS images in use, in their priority order and without drift, while a region's image definitions return one at a time outside the maintenance window", func() {
+					reconcileImagesOutsideWindow()
 					inUse := nodeClass.DeepCopy().Status.Images
 					expectNoDrift := func(step string) {
 						GinkgoHelper()
 						Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue(), step)
-						Expect(nodeClass.Status.Images).To(ConsistOf(inUse), step)
+						Expect(nodeClass.Status.Images).To(Equal(inUse), step)
 						nodeClaim.Labels[v1.LabelTopologyRegion] = fake.RegionNonZonal
 						for _, id := range fipsImageIDs("202610.30.1") {
 							nodeClaim.Status.ImageID = id
@@ -795,18 +796,42 @@ var _ = Describe("CloudProvider", func() {
 					}
 					expectNoDrift("before")
 
-					definitions := fipsDefinitions()
-					remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions
-					reconcileImages()
-					Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+					remote.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202611.06.0", time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)))
+					for _, reverse := range []bool{false, true} {
+						definitions := fipsDefinitions()
+						if reverse {
+							slices.Reverse(definitions)
+						}
+						remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions
+						reconcileImagesOutsideWindow()
+						Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+						Expect(nodeClass.Status.Images).To(Equal(inUse))
+						for i, definition := range definitions {
+							// The remote region lists the first i+1 image definitions in the order of their return.
+							remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions[i+1:]
+							reconcileImagesOutsideWindow()
+							expectNoDrift(fmt.Sprintf("%s returned, reverse priority order: %t", definition, reverse))
+						}
+					}
+				})
+				It("should launch a new node on the kept FIPS image of a skipped image definition ahead of lower-priority definitions", func() {
+					reconcileImagesOutsideWindow()
+					inUse := nodeClass.DeepCopy().Status.Images
+					remote.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202611.06.0", time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)))
+					remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()[:1]
+					reconcileImagesOutsideWindow()
+					Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+					// The previous spec asserts the order; this one shows its effect on a launch.
 					Expect(nodeClass.Status.Images).To(ConsistOf(inUse))
 
-					remote.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202611.06.0", time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)))
-					for i, definition := range definitions {
-						remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions[i+1:]
-						reconcileImages()
-						expectNoDrift(definition + " returned")
-					}
+					// Standard_D2s_v3 supports both Hyper-V generations, so it gets the first of the Gen2 and Gen1 images.
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2s_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					vm := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+					Expect(lo.FromPtr(vm.Location)).To(Equal(fake.RegionNonZonal))
+					Expect(lo.FromPtr(vm.Properties.StorageProfile.ImageReference.CommunityGalleryImageID)).To(Equal(fipsImageIDs("202610.30.1")[0]))
 				})
 			})
 			It("should keep a hydrated region when its refresh fails and fail stale quota open", func() {
