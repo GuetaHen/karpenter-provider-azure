@@ -1,0 +1,37 @@
+# The spec of the ValidatingAdmissionPolicy of the pod network agent. The chart, and the test in
+# pkg/podnetwork/policysuite, fill in the user of the agent's service account and the key of its
+# startup taint.
+failurePolicy: Fail
+matchConstraints:
+  resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["UPDATE"]
+      resources: ["nodes"]
+matchConditions:
+  - name: pod-network-agent
+    expression: 'request.userInfo.username == "__AGENT_USERNAME__"'
+variables:
+  - name: key
+    expression: '"__STARTUP_TAINT_KEY__"'
+  - name: otherTaints
+    expression: 'object.spec.?taints.orValue([]).filter(t, t.key != variables.key)'
+  - name: oldOtherTaints
+    expression: 'oldObject.spec.?taints.orValue([]).filter(t, t.key != variables.key)'
+validations:
+  # The node name comes from the agent's service account token, which the kubelet binds to the pod.
+  - expression: >-
+      has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name' in request.userInfo.extra &&
+      request.userInfo.extra['authentication.kubernetes.io/node-name'] == [object.metadata.name]
+    message: the pod network agent may change only the Node that it runs on
+  - expression: >-
+      variables.otherTaints == variables.oldOtherTaints &&
+      object.metadata.?labels.orValue({}) == oldObject.metadata.?labels.orValue({}) &&
+      object.metadata.?annotations.orValue({}) == oldObject.metadata.?annotations.orValue({}) &&
+      object.metadata.?finalizers.orValue([]) == oldObject.metadata.?finalizers.orValue([]) &&
+      object.metadata.?ownerReferences.orValue([]) == oldObject.metadata.?ownerReferences.orValue([]) &&
+      object.spec.?unschedulable.orValue(false) == oldObject.spec.?unschedulable.orValue(false) &&
+      object.spec.?providerID.orValue('') == oldObject.spec.?providerID.orValue('') &&
+      object.spec.?podCIDR.orValue('') == oldObject.spec.?podCIDR.orValue('') &&
+      object.spec.?podCIDRs.orValue([]) == oldObject.spec.?podCIDRs.orValue([])
+    message: the pod network agent may change only its startup taint on the Node

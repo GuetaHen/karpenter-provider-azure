@@ -111,6 +111,7 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	cp -f pkg/apis/crds/coexistence/multiregion.io_aksnodeclasses.yaml charts/karpenter-coexistence-crd/templates
 	hack/validation/capacitybuffer.sh
 	hack/validation/coexistence-chart.sh
+	hack/validation/pod-network-agent-chart.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\

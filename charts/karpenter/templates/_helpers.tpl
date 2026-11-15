@@ -194,3 +194,30 @@ Flatten the stderr logging outputs from args provided
 {{- end -}}
 {{ $paths | join ", " }}
 {{- end -}}
+
+{{/*
+Name of the objects of the pod network agent
+*/}}
+{{- define "karpenter.podNetworkAgent.name" -}}
+{{- printf "%s-pod-network-agent" (include "karpenter.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Selector labels of the pod network agent, which differ from those of the controller
+*/}}
+{{- define "karpenter.podNetworkAgent.selectorLabels" -}}
+app.kubernetes.io/name: {{ printf "%s-pod-network-agent" (include "karpenter.name" .) | trunc 63 | trimSuffix "-" }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{/*
+Image of the pod network agent, which needs a repository and a tag, a digest or both
+*/}}
+{{- define "karpenter.podNetworkAgent.image" -}}
+{{- $image := .Values.podNetworkAgent.image }}
+{{- $repository := required "podNetworkAgent.image.repository is required" $image.repository }}
+{{- if not (or $image.tag $image.digest) }}
+{{- fail "podNetworkAgent.image needs a tag or a digest" }}
+{{- end }}
+{{- $repository }}{{ with $image.tag }}:{{ . }}{{ end }}{{ with $image.digest }}@{{ . }}{{ end }}
+{{- end }}

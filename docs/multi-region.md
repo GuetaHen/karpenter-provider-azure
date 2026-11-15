@@ -224,6 +224,20 @@ kernel routes, and an exclusive Cilium renames other CNI files. The agent
 programs nothing on a node unless it can confirm both, nor on a node labelled
 `kubernetes.azure.com/ebpf-host-routing`.
 
+The release publishes no image of the agent. Build one from
+`cmd/pod-network-agent` for both architectures, for example with
+`KO_DOCKER_REPO=<registry> ko build --platform=linux/amd64,linux/arm64 ./cmd/pod-network-agent`,
+and set `podNetworkAgent.image.repository` with `tag`, `digest` or both. The
+image needs nothing but the agent's binary; `podNetworkAgent.command` sets the
+command for an image that holds it beside other programs. The DaemonSet runs
+with the priority class `system-node-critical`, resolves names with the node's
+DNS settings, gives the agent a minute to finish a running pass when it stops,
+and replaces its pods one node at a time without surge, so that two agents
+never program one node. With `podNetworkAgent.apiServer.host` and
+`podNetworkAgent.apiServer.port`, the agent reaches the API server there instead
+of through the `kubernetes` Service, which a new node serves only once its
+Cilium agent runs.
+
 The agent never assigns pod ranges and does not read `Node.spec.podCIDRs`. A
 node's range is the `/24` in `status.networkContainers[].primaryIP` of its Azure
 CNI Overlay `NodeNetworkConfig` (`kube-system/<node name>`), accepted only while
@@ -311,7 +325,8 @@ spec:
 
 With the agent enabled, the chart passes the key to the controller as
 `--multi-region-pod-network-startup-taint`
-(`MULTI_REGION_POD_NETWORK_STARTUP_TAINT`, default empty). The controller then
+(`MULTI_REGION_POD_NETWORK_STARTUP_TAINT`, default empty; do not set it in
+`controller.env` as well). The controller then
 refuses to launch a NodeClaim of a NodeClass with `regions`, before any write,
 unless its `startupTaints` hold a `NoSchedule` or `NoExecute` taint with that
 key. The agent removes the taint from its own node once the node no longer
@@ -343,7 +358,8 @@ Nodes and NodeClaims, patch Nodes, and in `kube-system` get, list and watch
 `nodenetworkconfigs.acn.azure.com` and get the `cilium-config` ConfigMap. A
 ValidatingAdmissionPolicy, which the chart installs with the agent unless
 `podNetworkAgent.admissionPolicy.enabled=false`, lets it patch only its own
-Node and only the startup taint.
+Node and only the startup taint. It recognizes the agent's Node by the node name
+in the agent's service account token, which Kubernetes adds from version 1.30.
 
 ### Per-region node identities
 
