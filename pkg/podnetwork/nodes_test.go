@@ -182,6 +182,12 @@ func TestEvaluateRejectsNodesThatFailACheck(t *testing.T) {
 		"a provider ID of a network interface": {func(cl *cluster) {
 			cl.nodes[1].Spec.ProviderID = strings.Replace(cl.nodes[1].Spec.ProviderID, "Microsoft.Compute/virtualMachines", "Microsoft.Network/networkInterfaces", 1)
 		}, "not a VM"},
+		"a provider ID of a scale set that names no instance": {func(cl *cluster) {
+			cl.nodes[1].Spec.ProviderID = "azure:///subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/CLUSTER-NODES/providers/Microsoft.Compute/virtualMachineScaleSets/regional-vmss/virtualMachines"
+		}, "names no VM"},
+		"a provider ID that ends in virtualMachines": {func(cl *cluster) {
+			cl.nodes[1].Spec.ProviderID = "azure:///subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/CLUSTER-NODES/providers/Microsoft.Compute/virtualMachines"
+		}, "no valid Azure resource ID"},
 		"two IPv4 InternalIPs": {func(cl *cluster) {
 			cl.nodes[1].Status.Addresses = append(cl.nodes[1].Status.Addresses, corev1.NodeAddress{Type: corev1.NodeInternalIP, Address: "10.1.0.5"})
 		}, "2 IPv4 InternalIPs instead of one"},

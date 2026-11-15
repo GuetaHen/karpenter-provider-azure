@@ -197,13 +197,19 @@ func (c *Config) checkProviderID(providerID string) error {
 		return errors.New("no Azure provider ID")
 	}
 	id, err := arm.ParseResourceID(raw)
-	if err != nil || !strings.EqualFold(id.SubscriptionID, c.nodeResourceGroup.SubscriptionID) ||
+	if err != nil {
+		return fmt.Errorf("the provider ID is no valid Azure resource ID: %w", err)
+	}
+	if !strings.EqualFold(id.SubscriptionID, c.nodeResourceGroup.SubscriptionID) ||
 		!strings.EqualFold(id.ResourceGroupName, c.nodeResourceGroup.ResourceGroupName) {
 		return errors.New("the provider ID is not in the node resource group")
 	}
 	if t := id.ResourceType.String(); !strings.EqualFold(t, "Microsoft.Compute/virtualMachines") &&
 		!strings.EqualFold(t, "Microsoft.Compute/virtualMachineScaleSets/virtualMachines") {
 		return fmt.Errorf("the provider ID names a resource of type %s, not a VM", t)
+	}
+	if id.Name == "" {
+		return errors.New("the provider ID names no VM")
 	}
 	return nil
 }

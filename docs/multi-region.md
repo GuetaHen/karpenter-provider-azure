@@ -260,9 +260,14 @@ the transit prefix is not inside `169.254.0.0/16`, has host bits, is too small
 for the pod CIDR or contains `169.254.169.254`. On every pass it changes nothing
 on the node while another VXLAN device uses UDP 4789, a device with one of its
 names is not its own, or a host address that it did not assign lies in the
-transit prefix; what it programmed before stays. A home node's peers are the
-regional nodes, and its CNI configuration stays as AKS wrote it. A regional
-node's peers are all other nodes, and there the agent also:
+transit prefix; what it programmed before stays. If it cannot finish creating
+one of its devices, it deletes the device again. When it is stopped, it
+finishes a running pass first; only if it is killed or crashes between
+creating a device and marking it as its own does the device stay unmarked,
+and the agent then refuses the node until the device is deleted or the node
+restarts. A home node's peers are the regional nodes, and its CNI
+configuration stays as AKS wrote it. A regional node's peers are all other
+nodes, and there the agent also:
 
 - writes a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the

@@ -58,6 +58,13 @@ func TestMetadataClientReadsTheLocalVM(t *testing.T) {
 		ResourceGroupName: "Cluster-Nodes",
 		PrivateIP:         netip.MustParseAddr("10.1.0.4"),
 	}))
+	// A valid document just under the limit of 1 MiB is read in full.
+	underLimit := strings.Replace(testMetadata, `"name": "regional-1"`,
+		`"name": "`+strings.Repeat("x", (1<<20)-1-len(testMetadata)+len("regional-1"))+`"`, 1)
+	g.Expect(underLimit).To(HaveLen((1 << 20) - 1))
+	md, err = metadataClient(t, http.StatusOK, underLimit).Get(t.Context())
+	g.Expect(err).ToNot(HaveOccurred(), "a document just under the limit")
+	g.Expect(md.PrivateIP).To(Equal(netip.MustParseAddr("10.1.0.4")))
 	oversized := strings.Replace(testMetadata, `"name": "regional-1"`, `"name": "`+strings.Repeat("x", 1<<20)+`"`, 1)
 	for name, bad := range map[string]struct {
 		status int

@@ -56,6 +56,8 @@ type fakeNode struct {
 	ciliumErr   error
 	calls       []string
 	plans       []Plan
+	// applying, when set, runs inside Apply after the call is recorded.
+	applying func()
 }
 
 func (f *fakeNode) Get(context.Context) (InstanceMetadata, error) {
@@ -67,10 +69,14 @@ func (f *fakeNode) Get(context.Context) (InstanceMetadata, error) {
 
 func (f *fakeNode) Apply(plan Plan) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls = append(f.calls, "tunnel")
 	f.plans = append(f.plans, plan)
-	return f.tunnelErr
+	err, applying := f.tunnelErr, f.applying
+	f.mu.Unlock()
+	if applying != nil {
+		applying()
+	}
+	return err
 }
 
 func (f *fakeNode) Ensure(podRange netip.Prefix) error {
@@ -768,4 +774,27 @@ func TestAgentWithdrawsANodeWhoseValuesChange(t *testing.T) {
 	a.Pass(ctx, false)
 	g.Expect(f.plans).To(HaveLen(2))
 	g.Expect(f.plans[1].Peers).To(BeEmpty())
+}
+
+func TestAgentFinishesAPassWhenItStops(t *testing.T) {
+	g := NewWithT(t)
+	a, _, f := newAgentTest(t, twoNodes(), "home-1", interceptor.Funcs{})
+	applying, release := make(chan struct{}), make(chan struct{})
+	f.applying = func() {
+		close(applying)
+		<-release
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.Run(ctx)
+	}()
+	g.Eventually(applying).Should(BeClosed())
+	cancel()
+	g.Consistently(done, 100*time.Millisecond).ShouldNot(BeClosed())
+	close(release)
+	g.Eventually(done).Should(BeClosed())
+	g.Expect(f.count("tunnel")).To(Equal(1))
+	g.Expect(a.Ready()).To(MatchError(context.Canceled))
 }

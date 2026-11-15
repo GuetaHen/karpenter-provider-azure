@@ -94,10 +94,14 @@ func NewHost() (*Host, error) {
 // peers. It changes nothing when another VXLAN device uses the tunnel port, when a device with a
 // tunnel name was not created by the agent, or when a host address that the agent did not assign
 // lies in the transit prefix. A peer whose destinations another program routes is left out and
-// reported in the error.
+// reported in the error. The firewall comes first, with every peer of the plan, so that the tunnel
+// port never accepts other sources, and once more at the end without the peers left out, if any.
 func (h *Host) Apply(plan Plan) error {
 	if err := h.check(plan); err != nil {
 		return err
+	}
+	if err := h.firewall.Apply(plan); err != nil {
+		return fmt.Errorf("programming the firewall: %w", err)
 	}
 	bridge, err := h.ensureBridge(plan)
 	if err != nil {
@@ -117,14 +121,14 @@ func (h *Host) Apply(plan Plan) error {
 	if err := h.syncNeighbors(programmed, bridge.Attrs().Index, vxlan.Attrs().Index); err != nil {
 		return err
 	}
+	if len(skipped) == 0 {
+		return nil
+	}
 	plan.Peers = programmed
 	if err := h.firewall.Apply(plan); err != nil {
 		return fmt.Errorf("programming the firewall: %w", err)
 	}
-	if len(skipped) > 0 {
-		return fmt.Errorf("left out peers whose destinations another program routes: %s", strings.Join(skipped, ", "))
-	}
-	return nil
+	return fmt.Errorf("left out peers whose destinations another program routes: %s", strings.Join(skipped, ", "))
 }
 
 // check refuses a node where another program uses the tunnel port, a tunnel device name or an
@@ -162,7 +166,7 @@ func checkDevices(links []netlink.Link) (map[int]bool, error) {
 		switch vxlan, isVXLAN := link.(*netlink.Vxlan); {
 		case attrs.Name == BridgeName || attrs.Name == VXLANName:
 			if attrs.Alias != deviceAlias {
-				return nil, fmt.Errorf("device %s exists, but the agent did not create it", attrs.Name)
+				return nil, fmt.Errorf("device %s exists, but the agent did not create it or its creation was interrupted: delete the device or restart the node", attrs.Name)
 			}
 			owned[attrs.Index] = true
 		case isVXLAN && vxlan.Port == TunnelPort:
@@ -213,12 +217,24 @@ func (h *Host) ensureVXLAN(plan Plan, bridge netlink.Link) (netlink.Link, error)
 	return link, h.attach(link, bridge)
 }
 
-// create adds a device, marks it as the agent's and sets it up.
+// create adds a device, marks it as the agent's and sets it up. When a step after the addition fails,
+// it deletes the device again, as far as it can, because every later pass would refuse an unmarked
+// device with a tunnel name, and returns the error of the step.
 func (h *Host) create(link netlink.Link) (netlink.Link, error) {
 	name := link.Attrs().Name
 	if err := h.kernel.LinkAdd(link); err != nil {
 		return nil, fmt.Errorf("creating device %s: %w", name, err)
 	}
+	created, err := h.markAndSetUp(name)
+	if err != nil {
+		_ = h.kernel.LinkDel(link)
+		return nil, err
+	}
+	return created, nil
+}
+
+// markAndSetUp marks a device that the agent added as its own and sets it up.
+func (h *Host) markAndSetUp(name string) (netlink.Link, error) {
 	created, err := h.kernel.LinkByName(name)
 	if err != nil {
 		return nil, fmt.Errorf("reading device %s: %w", name, err)
@@ -271,7 +287,10 @@ func (h *Host) ensureAddress(plan Plan, bridge netlink.Link) error {
 // syncRoutes programs, for every peer, a link route to its transit address and a route to its pod
 // range through that address, both with the node's own transit address as source. It leaves out a
 // peer whose destinations another program routes, deletes the routes of the agent that the plan
-// no longer holds, and returns the programmed peers and the names of the others.
+// no longer holds, and returns the programmed peers and the names of the others. A route of another
+// program counts only when its destination is exactly the transit address or the pod range of a
+// peer: a more specific route inside a peer's pod range goes unseen, and the traffic for that part
+// follows it.
 func (h *Host) syncRoutes(plan Plan, bridge int) ([]Peer, []string, error) {
 	routes, err := h.kernel.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
 	if err != nil {

@@ -45,9 +45,14 @@ type fakeKernel struct {
 	routes   []netlink.Route
 	learning map[string]bool
 	changes  []string
+	// fail names, for an operation, the device on which it fails.
+	fail map[string]string
 }
 
 func (k *fakeKernel) LinkByName(name string) (netlink.Link, error) {
+	if k.fail["LinkByName"] == name {
+		return nil, errors.New("reading failed")
+	}
 	for _, link := range k.links {
 		if link.Attrs().Name == name {
 			return link, nil
@@ -58,8 +63,10 @@ func (k *fakeKernel) LinkByName(name string) (netlink.Link, error) {
 
 func (k *fakeKernel) LinkList() ([]netlink.Link, error) { return k.links, nil }
 
+// LinkAdd adds a device without the alias, which create sets apart.
 func (k *fakeKernel) LinkAdd(link netlink.Link) error {
 	link.Attrs().Index = 100 + len(k.changes)
+	link.Attrs().Alias = ""
 	k.links = append(k.links, link)
 	k.changes = append(k.changes, "add link "+link.Attrs().Name)
 	return nil
@@ -77,11 +84,17 @@ func (k *fakeKernel) LinkDel(link netlink.Link) error {
 }
 
 func (k *fakeKernel) LinkSetUp(link netlink.Link) error {
+	if k.fail["LinkSetUp"] == link.Attrs().Name {
+		return errors.New("setting up failed")
+	}
 	link.Attrs().Flags |= net.FlagUp
 	return nil
 }
 
 func (k *fakeKernel) LinkSetAlias(link netlink.Link, alias string) error {
+	if k.fail["LinkSetAlias"] == link.Attrs().Name {
+		return errors.New("marking failed")
+	}
 	link.Attrs().Alias = alias
 	return nil
 }
@@ -192,10 +205,19 @@ func (k *fakeKernel) neighbor(index, family int, ip string) *netlink.Neigh {
 	return nil
 }
 
-type fakeFirewall struct{ plans []Plan }
+// fakeFirewall records the plans that it applies and, for each, how many changes the kernel made
+// before.
+type fakeFirewall struct {
+	kernel *fakeKernel
+	plans  []Plan
+	at     []int
+}
 
 func (f *fakeFirewall) Apply(plan Plan) error {
 	f.plans = append(f.plans, plan)
+	if f.kernel != nil {
+		f.at = append(f.at, len(f.kernel.changes))
+	}
 	return nil
 }
 
@@ -215,7 +237,7 @@ func testHost() (*Host, *fakeKernel, *fakeFirewall) {
 		addrs:  []netlink.Addr{{IPNet: ipNet("10.1.0.4/24"), LinkIndex: 2}, {IPNet: ipNet("169.254.23.0/32"), LinkIndex: 3}},
 		routes: []netlink.Route{{LinkIndex: 2, Dst: ipNet("10.1.0.0/24"), Protocol: unix.RTPROT_KERNEL}},
 	}
-	f := &fakeFirewall{}
+	f := &fakeFirewall{kernel: k}
 	return &Host{kernel: k, firewall: f}, k, f
 }
 
@@ -262,6 +284,7 @@ func TestHostProgramsTheTunnelAndRemovesFormerPeers(t *testing.T) {
 	expectProgrammed(g, k, plan)
 	g.Expect(f.plans).To(HaveLen(1))
 	g.Expect(f.plans[0].Peers).To(HaveLen(2))
+	g.Expect(f.at).To(Equal([]int{0}), "the firewall comes before the devices")
 
 	// A restarted agent adopts its devices. A former peer loses its routes and entries, and the
 	// bridge loses any other address. Learned entries, the entries of the bridge on its port and the
@@ -342,7 +365,7 @@ func TestHostRefusesANodeThatAnotherProgramUses(t *testing.T) {
 		}, "VXLAN device vxlan0 already uses UDP port 4789"},
 		"a bridge with the tunnel name": {func(k *fakeKernel) {
 			k.links = append(k.links, &netlink.Bridge{LinkAttrs: netlink.LinkAttrs{Name: BridgeName, Index: 4}})
-		}, "device kpnbr0 exists, but the agent did not create it"},
+		}, "device kpnbr0 exists, but the agent did not create it or its creation was interrupted: delete the device or restart the node"},
 		"a host address in the transit prefix": {func(k *fakeKernel) {
 			k.addrs = append(k.addrs, netlink.Addr{IPNet: ipNet("169.254.64.200/32"), LinkIndex: 2})
 		}, "address 169.254.64.200 of another device lies in the transit prefix"},
@@ -372,8 +395,30 @@ func TestHostLeavesOutAPeerWhoseDestinationAnotherProgramRoutes(t *testing.T) {
 			g.Expect(k.route(dsts[0])).To(gstruct.PointTo(HaveField("LinkIndex", 2)), "the route of the other program stays")
 			g.Expect(k.route(dsts[1])).To(BeNil())
 			g.Expect(k.neighs).ToNot(ContainElement(HaveField("HardwareAddr", TransitMAC(netip.MustParseAddr("169.254.64.255")))))
-			g.Expect(f.plans[0].Peers).To(ConsistOf(HaveField("Name", "home-1")))
+			g.Expect(f.plans).To(HaveLen(2))
+			g.Expect(f.plans[0].Peers).To(HaveLen(2))
+			g.Expect(f.plans[1].Peers).To(ConsistOf(HaveField("Name", "home-1")))
+			g.Expect(f.at).To(Equal([]int{0, len(k.changes)}), "the firewall comes first, and once more at the end")
 			expectProgrammed(g, k, testConfig(t).TunnelPlan(regionalOwn, []Node{homePeer}))
+		})
+	}
+}
+
+func TestHostDeletesADeviceWhoseSetupFails(t *testing.T) {
+	for _, step := range []string{"LinkByName", "LinkSetAlias", "LinkSetUp"} {
+		t.Run(step, func(t *testing.T) {
+			g := NewWithT(t)
+			host, k, _ := testHost()
+			k.fail = map[string]string{step: VXLANName}
+			plan := testConfig(t).TunnelPlan(regionalOwn, []Node{homePeer})
+			g.Expect(host.Apply(plan)).To(MatchError(ContainSubstring("device " + VXLANName)))
+			g.Expect(k.changes).To(ContainElements("add link "+VXLANName, "delete link "+VXLANName))
+			g.Expect(k.links).ToNot(ContainElement(WithTransform(func(l netlink.Link) string { return l.Attrs().Name }, Equal(VXLANName))))
+
+			// The next pass creates the device again instead of refusing the node.
+			k.fail = nil
+			g.Expect(host.Apply(plan)).To(Succeed())
+			expectProgrammed(g, k, plan)
 		})
 	}
 }
