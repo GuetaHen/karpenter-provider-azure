@@ -40,7 +40,8 @@ const (
 
 func testConfig(t *testing.T) *Config {
 	t.Helper()
-	c := &Config{PodCIDR: netip.MustParsePrefix("10.244.0.0/16"), NodeResourceGroupID: testResourceGroupID, NodeClassGroup: testGroup}
+	c := &Config{PodCIDR: netip.MustParsePrefix("10.244.0.0/16"), NodeResourceGroupID: testResourceGroupID, NodeClassGroup: testGroup,
+		TransitPrefix: netip.MustParsePrefix(DefaultTransitPrefix)}
 	if err := c.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +121,8 @@ func TestConfigValidate(t *testing.T) {
 		"a VM instead of a group":    func(c *Config) { c.NodeResourceGroupID += "/providers/Microsoft.Compute/virtualMachines/vm" },
 		"no node class group":        func(c *Config) { c.NodeClassGroup = "" },
 	} {
-		c := &Config{PodCIDR: netip.MustParsePrefix("10.244.0.0/16"), NodeResourceGroupID: testResourceGroupID, NodeClassGroup: testGroup}
+		c := &Config{PodCIDR: netip.MustParsePrefix("10.244.0.0/16"), NodeResourceGroupID: testResourceGroupID, NodeClassGroup: testGroup,
+			TransitPrefix: netip.MustParsePrefix(DefaultTransitPrefix)}
 		change(c)
 		g.Expect(c.Validate()).ToNot(Succeed(), name)
 	}

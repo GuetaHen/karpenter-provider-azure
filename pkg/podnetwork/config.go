@@ -37,6 +37,8 @@ type Config struct {
 	// NodeClassGroup is the API group of the node classes of the controller that creates regional
 	// nodes: karpenter.azure.com, or multiregion.io in coexistence mode.
 	NodeClassGroup string
+	// TransitPrefix holds the transit addresses of the nodes, one for every /24 of the pod CIDR.
+	TransitPrefix netip.Prefix
 
 	nodeResourceGroup *arm.ResourceID
 }
@@ -45,6 +47,9 @@ type Config struct {
 func (c *Config) Validate() error {
 	if p := c.PodCIDR; !p.IsValid() || !p.Addr().Is4() || p.Bits() > 24 || p.Masked() != p {
 		return fmt.Errorf("the pod CIDR %s must be an IPv4 prefix of length 24 or less without host bits", p)
+	}
+	if err := c.validateTransit(); err != nil {
+		return err
 	}
 	id, err := arm.ParseResourceID(c.NodeResourceGroupID)
 	if err != nil || !strings.EqualFold(id.ResourceType.String(), "Microsoft.Resources/resourceGroups") {
