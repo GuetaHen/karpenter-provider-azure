@@ -72,6 +72,14 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+"true" when the chart installs the pod network agent. Values without a podNetworkAgent key, such as
+those that helm upgrade --reuse-values keeps from a release of an earlier chart, install no agent.
+*/}}
+{{- define "karpenter.podNetworkAgent.enabled" -}}
+{{- if eq (dig "podNetworkAgent" "enabled" false .Values.AsMap | toString) "true" }}true{{ end }}
+{{- end }}
+
+{{/*
 API group of the AKSNodeClasses that the controller serves
 */}}
 {{- define "karpenter.aksNodeClassGroup" -}}

@@ -1,4 +1,4 @@
-{{- if .Values.podNetworkAgent.enabled }}
+{{- if include "karpenter.podNetworkAgent.enabled" . }}
 {{- $agent := .Values.podNetworkAgent }}
 {{- $name := include "karpenter.podNetworkAgent.name" . }}
 apiVersion: v1
@@ -27,9 +27,10 @@ rules:
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
+  # The agent only lists and watches NodeClaims and NodeNetworkConfigs, through its cache.
   - apiGroups: ["karpenter.sh"]
     resources: ["nodeclaims"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -64,7 +65,7 @@ metadata:
 rules:
   - apiGroups: ["acn.azure.com"]
     resources: ["nodenetworkconfigs"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["list", "watch"]
   - apiGroups: [""]
     resources: ["configmaps"]
     resourceNames: ["cilium-config"]

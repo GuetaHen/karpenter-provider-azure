@@ -108,7 +108,7 @@ spec:
             - name: COEXISTENCE_MODE
               value: "true"
           {{- end }}
-          {{- if .Values.podNetworkAgent.enabled }}
+          {{- if include "karpenter.podNetworkAgent.enabled" . }}
             - name: MULTI_REGION_POD_NETWORK_STARTUP_TAINT
               value: {{ .Values.podNetworkAgent.startupTaintKey | quote }}
           {{- end }}

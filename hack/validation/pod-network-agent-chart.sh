@@ -2,8 +2,9 @@
 set -euo pipefail
 
 # Validates the pod network agent of the controller chart:
-# - by default the chart renders no object of the agent and passes no startup taint key to the
-#   controller;
+# - by default, and without podNetworkAgent values, as helm upgrade --reuse-values keeps them from a
+#   release of an earlier chart, the chart renders no object of the agent and passes no startup taint
+#   key to the controller;
 # - with the agent on, it requires the image, the pod CIDR and the node resource group ID, and passes
 #   the startup taint key to the controller;
 # - the DaemonSet runs the agent on every Linux node except virtual nodes, with host networking and the
@@ -12,8 +13,8 @@ set -euo pipefail
 #   the agent as root with only NET_ADMIN and a read-only root file system, mounts the CNI directories,
 #   runs the entrypoint of the image unless podNetworkAgent.command is set, and points the agent at
 #   podNetworkAgent.apiServer when that is set;
-# - the agent may read Nodes and NodeClaims, patch Nodes, and read NodeNetworkConfigs and
-#   cilium-config in kube-system; and
+# - the agent may read and patch Nodes, list and watch NodeClaims, and in kube-system list and watch
+#   NodeNetworkConfigs and read cilium-config; and
 # - the admission policy is the policy file with the agent's user and startup taint key, unless
 #   podNetworkAgent.admissionPolicy.enabled=false.
 
@@ -61,6 +62,10 @@ expect_refused() {
 render >"$tmp_dir/default.yaml"
 [[ -z "$(agent_kinds "$tmp_dir/default.yaml")" && -z "$(controller_env "$tmp_dir/default.yaml" MULTI_REGION_POD_NETWORK_STARTUP_TAINT)" ]] ||
     fail "expected no object of the pod network agent and no startup taint key for the controller by default"
+# helm upgrade --reuse-values keeps the values of a release of an earlier chart, which have no podNetworkAgent key.
+render --set podNetworkAgent=null >"$tmp_dir/no-values.yaml" || fail "expected the chart to render without podNetworkAgent values"
+[[ -z "$(agent_kinds "$tmp_dir/no-values.yaml")" && -z "$(controller_env "$tmp_dir/no-values.yaml" MULTI_REGION_POD_NETWORK_STARTUP_TAINT)" ]] ||
+    fail "expected no object of the pod network agent and no startup taint key for the controller without podNetworkAgent values"
 
 for value in image.repository podCIDR nodeResourceGroupID; do
     expect_refused "podNetworkAgent.$value is required" "${agent[@]}" --set "podNetworkAgent.$value="
@@ -107,12 +112,12 @@ agent_object "$tmp_dir/agent.yaml" DaemonSet | jq -e --arg key "$key" --arg grou
 
 agent_object "$tmp_dir/agent.yaml" ClusterRole | jq -e '.rules == [
     {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list", "watch", "patch"]},
-    {"apiGroups": ["karpenter.sh"], "resources": ["nodeclaims"], "verbs": ["get", "list", "watch"]}]' >/dev/null ||
-    fail "expected the agent to read Nodes and NodeClaims and to patch Nodes"
+    {"apiGroups": ["karpenter.sh"], "resources": ["nodeclaims"], "verbs": ["list", "watch"]}]' >/dev/null ||
+    fail "expected the agent to read and patch Nodes and to list and watch NodeClaims"
 agent_object "$tmp_dir/agent.yaml" Role | jq -e '.metadata.namespace == "kube-system" and .rules == [
-    {"apiGroups": ["acn.azure.com"], "resources": ["nodenetworkconfigs"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": ["acn.azure.com"], "resources": ["nodenetworkconfigs"], "verbs": ["list", "watch"]},
     {"apiGroups": [""], "resources": ["configmaps"], "resourceNames": ["cilium-config"], "verbs": ["get"]}]' >/dev/null ||
-    fail "expected the agent to read NodeNetworkConfigs and cilium-config in kube-system"
+    fail "expected the agent to list and watch NodeNetworkConfigs and to read cilium-config in kube-system"
 for kind in ClusterRoleBinding RoleBinding; do
     agent_object "$tmp_dir/agent.yaml" "$kind" | jq -e --arg name "$name" '.roleRef.name == $name
         and .subjects == [{"kind": "ServiceAccount", "name": $name, "namespace": "karpenter"}]' >/dev/null ||

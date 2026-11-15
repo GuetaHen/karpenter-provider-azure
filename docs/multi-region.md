@@ -376,8 +376,8 @@ The agent runs as root with host networking but unprivileged: only the
 `NET_ADMIN` capability, no privilege escalation, a read-only root file system
 and the `RuntimeDefault` seccomp profile, with the host's `/etc/cni/net.d`
 writable and `/opt/cni/bin` read-only. Its namespace needs the `privileged` Pod
-Security level. It holds no Azure credentials. It may get, list and watch
-Nodes and NodeClaims, patch Nodes, and in `kube-system` get, list and watch
+Security level. It holds no Azure credentials. It may get, list, watch and
+patch Nodes, list and watch NodeClaims, and in `kube-system` list and watch
 `nodenetworkconfigs.acn.azure.com` and get the `cilium-config` ConfigMap. A
 ValidatingAdmissionPolicy, which the chart installs with the agent unless
 `podNetworkAgent.admissionPolicy.enabled=false`, lets it patch only its own
