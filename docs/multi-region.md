@@ -54,6 +54,17 @@ Nodes opted into this feature are excluded from external load balancers, even
 when the selected region is the cluster region. Exposing workloads requires a
 separately validated ingress/service architecture.
 
+On Azure CNI Overlay with the [pod network agent](#pod-network-agent), Cilium
+forwards a request that a node receives for a LoadBalancer or NodePort Service
+with `externalTrafficPolicy: Cluster` to an endpoint on another node after
+translating the request's source to its own node IP. An endpoint on a regional
+node answers that node IP through the regional node's own interface, where
+Azure drops the answer, so such connections fail. Give these Services
+`externalTrafficPolicy: Local` with at least one endpoint on a home node, keep
+their endpoints off regional nodes, or reach them through an ingress
+controller. Clients inside the cluster, which Cilium load-balances at the
+socket, are not affected.
+
 ## Configuration
 
 Install the CRD from the same fork revision as the controller. Existing
@@ -230,17 +241,24 @@ private IP, and the subscription and resource group of both
 
 On every node the agent programs a VXLAN tunnel on UDP 4789 with MTU 1400,
 whose VNI derives from the node resource group ID. The VXLAN device is a port
-of a bridge that holds the node's transit address. That address and the
-device's MAC derive from the index of the node's `/24` in the pod CIDR, inside
-`podNetworkAgent.transitPrefix` (default `169.254.64.0/20`, enough for pod
-CIDRs up to `/13`). For each peer the agent adds a permanent neighbour entry, a
-static forwarding entry to the peer's node IP and a route to the peer's `/24`,
-so nothing relies on ARP or flooding. It accepts UDP 4789 only from peers' node
-IPs, sets TCP MSS 1360 on SYNs into the tunnel, and does not start when another
-VXLAN device uses UDP 4789 or a host address lies in the transit prefix. A home
-node's peers are the regional nodes, and its CNI configuration stays as AKS
-wrote it. A regional node's peers are all other nodes, and there the agent
-also:
+of a bridge that holds the node's transit address as a `/32`: the node with the
+n-th `/24` of the pod CIDR, counting from 0, gets the n-th address of
+`podNetworkAgent.transitPrefix` (default `169.254.64.0/18`, enough for pod
+CIDRs up to `/10`), and its bridge gets the MAC address `02:00` followed by the
+four bytes of that address. For each peer the agent adds a permanent neighbour
+entry, a static forwarding entry to the peer's node IP, a route to the peer's
+transit address, and a route to the peer's `/24` through that address with the
+node's own transit address as source, so nothing relies on ARP or flooding. A
+connection that a node itself opens to a pod on another node therefore carries
+the node's transit address, which Cilium treats as `world`: a NetworkPolicy
+that admits only cluster or node sources does not admit it. The agent accepts
+UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs into the
+tunnel. It does not start when the transit prefix is not inside
+`169.254.0.0/16`, is too small for the pod CIDR or contains `169.254.169.254`,
+when another VXLAN device uses UDP 4789, or when a host address that the agent
+did not assign lies in the transit prefix. A home node's peers are the regional
+nodes, and its CNI configuration stays as AKS wrote it. A regional node's peers
+are all other nodes, and there the agent also:
 
 - writes, once, a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the
