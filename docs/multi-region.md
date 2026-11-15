@@ -180,8 +180,9 @@ default `false`) accepts `regions` on Azure CNI Overlay. The controller does not
 start with it unless `--enable-multi-region`, `NETWORK_PLUGIN=azure` and
 `NETWORK_PLUGIN_MODE=overlay` are also set. The provider then bootstraps
 regional nodes as the [node contract](#node-contract) lists and leaves their pod
-network to an agent outside this provider: it writes no CNI configuration beyond
-a home node's and creates no routes, peerings, tunnels or pod address ranges.
+network to an agent, such as the chart's [pod network agent](#pod-network-agent):
+the controller writes no CNI configuration beyond a home node's and creates no
+routes, peerings, tunnels or pod address ranges.
 Overlay pod ranges belong to the cluster VNet, so a regional node pairs the
 cluster's `VNET_GUID` in `kubernetes.azure.com/nodenetwork-vnetguid` with the
 name of the subnet its NIC is in.
@@ -196,6 +197,104 @@ provider sets on every node of a NodeClass with `regions` and on no other node,
 or by the `karpenter.azure.com/region-placement` annotation, which such a
 NodeClaim carries from launch and its Node from registration. Do not set that
 label in the template of a home NodePool.
+
+### Pod network agent
+
+The `karpenter` chart can run a pod network agent, built from this repository
+for amd64 and arm64, that supplies the pod network of regional nodes on Azure
+CNI Overlay with the AKS-managed Cilium dataplane. It is off by default.
+`podNetworkAgent.enabled=true` runs it as a DaemonSet on every Linux node and
+needs `--multi-region-external-pod-network`, the cluster pod CIDR in
+`podNetworkAgent.podCIDR` and the ARM ID of the node resource group in
+`podNetworkAgent.nodeResourceGroupID`. The node subnets of the cluster and of
+every region must reach each other, with UDP 4789 allowed between them. In
+`kube-system/cilium-config`, `enable-host-legacy-routing` must be `true` and
+`cni-exclusive` must not be `true`: eBPF host routing bypasses the agent's
+kernel routes, and an exclusive Cilium renames other CNI files. The agent
+programs nothing on a node unless it can confirm both, nor on a node labelled
+`kubernetes.azure.com/ebpf-host-routing`.
+
+The agent never assigns pod ranges. A node's range is the `/24` in its Azure
+CNI Overlay `NodeNetworkConfig` (`kube-system/<node name>`), accepted only while
+that object belongs to the Node's current UID and names its `InternalIP`, and
+the `/24` lies in the pod CIDR and overlaps no other node's range. The agent
+pins each node's range, region, VM ID and IP in memory when it accepts them; a
+later change removes the node as a peer. A node is regional when it is
+registered, carries the `karpenter.azure.com/region-placement` annotation, and
+exactly one NodeClaim of this controller's node class group has its provider ID
+and a placement that matches the VM's location and the node's region label.
+Before it programs its own node, the agent also requires instance metadata to
+report the Node's `systemUUID` as VM ID, ignoring case, its `InternalIP` as
+private IP, and the subscription and resource group of both
+`podNetworkAgent.nodeResourceGroupID` and the Node's provider ID.
+
+On every node the agent programs a VXLAN tunnel on UDP 4789 with MTU 1400,
+whose VNI derives from the node resource group ID. The VXLAN device is a port
+of a bridge that holds the node's transit address. That address and the
+device's MAC derive from the index of the node's `/24` in the pod CIDR, inside
+`podNetworkAgent.transitPrefix` (default `169.254.64.0/20`, enough for pod
+CIDRs up to `/13`). For each peer the agent adds a permanent neighbour entry, a
+static forwarding entry to the peer's node IP and a route to the peer's `/24`,
+so nothing relies on ARP or flooding. It accepts UDP 4789 only from peers' node
+IPs, sets TCP MSS 1360 on SYNs into the tunnel, and does not start when another
+VXLAN device uses UDP 4789 or a host address lies in the transit prefix. A home
+node's peers are the regional nodes, and its CNI configuration stays as AKS
+wrote it. A regional node's peers are all other nodes, and there the agent
+also:
+
+- writes, once, a CNI configuration that sorts before every other file in
+  `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the
+  node's `/24` (addresses `.2` to `.254`, gateway `.1`), chained with the
+  `tuning` plugin for MTU 1400; it writes nothing while an earlier file exists;
+- masquerades pod traffic that leaves through the node's own interface;
+- drops forwarded traffic to `169.254.169.254`, so that pods cannot reach
+  instance metadata.
+
+A regional node offers 253 pod addresses, so a NodeClass that sets `maxPods`
+above 253 is not supported on regional nodes.
+
+The agent re-checks a peer on every change of its Node, NodeClaim or
+`NodeNetworkConfig`, re-validates everything every 60 seconds, and removes a
+peer's route as soon as a check fails. It marks its devices with an alias,
+keeps its rules in its own nftables table and its routes under its own
+protocol and metric, and never adopts or overwrites a device, route or CNI
+file that it did not create.
+
+Every NodePool whose NodeClass lists regions sets the agent's startup taint,
+whose key is `podNetworkAgent.startupTaintKey`:
+
+```yaml
+spec:
+  template:
+    spec:
+      startupTaints:
+        - key: karpenter.azure.com/regional-pod-network-not-ready
+          effect: NoSchedule
+```
+
+With the agent enabled, the chart passes the key to the controller as
+`--multi-region-pod-network-startup-taint`
+(`MULTI_REGION_POD_NETWORK_STARTUP_TAINT`, default empty). The controller then
+refuses to launch a NodeClaim of a NodeClass with `regions`, before any write,
+unless its `startupTaints` hold a `NoSchedule` or `NoExecute` taint with that
+key. The agent removes the taint from its own node once its checks pass, the
+CNI file is in place, the tunnel is programmed and the node's Cilium agent is
+healthy (`http://127.0.0.1:9879/healthz` with the header `brief: true`). It
+puts the taint back when any of that fails later, unless the Node is being
+deleted, and its readiness probe reports the same state. A regional node that
+never becomes ready stays tainted until its NodeClaim is deleted; this provider
+has no repair policy for it.
+
+The agent runs as root with host networking but unprivileged: only the
+`NET_ADMIN` capability, no privilege escalation, a read-only root file system
+and the `RuntimeDefault` seccomp profile, with the host's `/etc/cni/net.d`
+writable and `/opt/cni/bin` read-only. Its namespace needs the `privileged` Pod
+Security level. It holds no Azure credentials. It may get, list and watch
+Nodes and NodeClaims, patch Nodes, and in `kube-system` get, list and watch
+`nodenetworkconfigs.acn.azure.com` and get the `cilium-config` ConfigMap. A
+ValidatingAdmissionPolicy, which the chart installs with the agent unless
+`podNetworkAgent.admissionPolicy.enabled=false`, lets it patch only its own
+Node and only the startup taint.
 
 ### Per-region node identities
 
