@@ -202,6 +202,10 @@ podNetworkAgent:
   probePort: 9887
   # -- PriorityClass name of the agent pods.
   priorityClassName: system-node-critical
+  # -- Number or percentage of agent pods that a rollout replaces at a time, never with surge, so that two agents never
+  # program one node. The pod on a node that the agent refuses stays unready and counts against it, so that this many
+  # refused nodes stall every rollout.
+  maxUnavailable: 1
   # -- Resources of the agent container.
   resources: {}
   admissionPolicy:

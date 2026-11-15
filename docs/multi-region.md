@@ -211,17 +211,19 @@ label in the template of a home NodePool.
 The `karpenter` chart can run a pod network agent, built from this repository
 for amd64 and arm64, that supplies the pod network of regional nodes on Azure
 CNI Overlay with the AKS-managed Cilium dataplane. It is off by default.
-`podNetworkAgent.enabled=true` runs it as a DaemonSet on every Linux node. The
+`podNetworkAgent.enabled=true` runs it as a DaemonSet on every Linux node except
+virtual nodes (label `type=virtual-kubelet`), as the AKS DaemonSets do. The
 DaemonSet tolerates every taint, because the agent must run on a node that still
 carries the startup taint it removes. The agent needs
 `--multi-region-external-pod-network`, the cluster pod CIDR in
 `podNetworkAgent.podCIDR` and the ARM ID of the node resource group in
 `podNetworkAgent.nodeResourceGroupID`. The node subnets of the cluster and of
 every region must reach each other, with UDP 4789 allowed between them. In
-`kube-system/cilium-config`, `enable-host-legacy-routing` must be `true` and
-`cni-exclusive` must not be `true`: eBPF host routing bypasses the agent's
-kernel routes, and an exclusive Cilium renames other CNI files. The agent
-programs nothing on a node unless it can confirm both, nor on a node labelled
+`kube-system/cilium-config`, `enable-host-legacy-routing` must be set to `true`
+and `cni-exclusive` to `false`; an unset key does not count. eBPF host routing
+bypasses the agent's kernel routes, and an exclusive Cilium renames other CNI
+files. The agent programs nothing on a node unless it can confirm both, nor on
+a node labelled
 `kubernetes.azure.com/ebpf-host-routing`.
 
 The release publishes no image of the agent. Build one from
@@ -232,11 +234,19 @@ image needs nothing but the agent's binary; `podNetworkAgent.command` sets the
 command for an image that holds it beside other programs. The DaemonSet runs
 with the priority class `system-node-critical`, resolves names with the node's
 DNS settings, gives the agent a minute to finish a running pass when it stops,
-and replaces its pods one node at a time without surge, so that two agents
-never program one node. With `podNetworkAgent.apiServer.host` and
-`podNetworkAgent.apiServer.port`, the agent reaches the API server there instead
-of through the `kubernetes` Service, which a new node serves only once its
-Cilium agent runs.
+and replaces its pods without surge, so that two agents never program one node,
+`podNetworkAgent.maxUnavailable` at a time, one by default. With
+`podNetworkAgent.apiServer.host` and `podNetworkAgent.apiServer.port`, the agent
+reaches the API server there instead of through the `kubernetes` Service, which
+a new node serves only once its Cilium agent runs.
+
+An agent pod is ready only while its node meets the conditions under which the
+agent removes the startup taint, described below. On a node that the agent
+refuses for good, the pod stays unready and counts against
+`podNetworkAgent.maxUnavailable`, so that many such nodes stall every later
+rollout of the DaemonSet: `kubectl rollout status` on it does not finish, and
+the log of an unready agent pod says why the agent refuses its node. Fix or
+replace those nodes, or raise `podNetworkAgent.maxUnavailable`.
 
 The agent never assigns pod ranges and does not read `Node.spec.podCIDRs`. A
 node's range is the `/24` in `status.networkContainers[].primaryIP` of its Azure
@@ -301,6 +311,10 @@ AKS, Azure CNS writes the CNI configuration of the Cilium dataplane only after
 the Azure host reports the node's network container as programmed, and hands
 out no pod address until then. Once the agent's file is in place, a later CNI
 configuration does not matter, and an earlier one makes the node not ready.
+The agent never rewrites its file and refuses a node whose file holds other
+bytes, so an agent version that changes the content of the file keeps every
+regional node that holds the file of an earlier version not ready and tainted
+until the node is replaced.
 
 The agent re-checks a peer on every change of its Node, NodeClaim or
 `NodeNetworkConfig`, re-validates everything every 60 seconds, and removes a
@@ -337,7 +351,10 @@ is in place. It puts the taint back only on a node whose NodeClaim, of this
 controller's node class group, carries the
 `karpenter.azure.com/region-placement` annotation, when any of that fails
 later, only on the Node with the UID it checked and unless that Node is being
-deleted. Its readiness probe reports the same conditions, apart from the
+deleted. One failed pass is enough: while the node's Cilium agent restarts, for
+example, a regional node carries the taint until a pass succeeds again, which
+the agent retries every 5 seconds, and the pods that run on it keep running.
+The agent's readiness probe reports the same conditions, apart from the
 registration. A regional node that never becomes ready stays tainted until its
 NodeClaim is deleted; this provider has no repair policy for it.
 

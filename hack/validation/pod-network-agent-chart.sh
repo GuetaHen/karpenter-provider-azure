@@ -6,11 +6,12 @@ set -euo pipefail
 #   controller;
 # - with the agent on, it requires the image, the pod CIDR and the node resource group ID, and passes
 #   the startup taint key to the controller;
-# - the DaemonSet runs the agent on every Linux node with host networking and the node's DNS settings,
-#   tolerates every taint, gives the agent a minute to finish a pass when it stops, replaces its pods
-#   one node at a time without surge, runs the agent as root with only NET_ADMIN and a read-only root
-#   file system, mounts the CNI directories, runs the entrypoint of the image unless
-#   podNetworkAgent.command is set, and points the agent at podNetworkAgent.apiServer when that is set;
+# - the DaemonSet runs the agent on every Linux node except virtual nodes, with host networking and the
+#   node's DNS settings, tolerates every taint, gives the agent a minute to finish a pass when it stops,
+#   replaces its pods without surge and podNetworkAgent.maxUnavailable at a time, one by default, runs
+#   the agent as root with only NET_ADMIN and a read-only root file system, mounts the CNI directories,
+#   runs the entrypoint of the image unless podNetworkAgent.command is set, and points the agent at
+#   podNetworkAgent.apiServer when that is set;
 # - the agent may read Nodes and NodeClaims, patch Nodes, and read NodeNetworkConfigs and
 #   cilium-config in kube-system; and
 # - the admission policy is the policy file with the agent's user and startup taint key, unless
@@ -79,6 +80,8 @@ agent_object "$tmp_dir/agent.yaml" DaemonSet | jq -e --arg key "$key" --arg grou
     and (.spec.template.spec | .hostNetwork == true and .dnsPolicy == "Default" and .terminationGracePeriodSeconds == 60
         and .priorityClassName == "system-node-critical" and .serviceAccountName == $name
         and .tolerations == [{"operator": "Exists"}] and .nodeSelector == {"kubernetes.io/os": "linux"}
+        and .affinity == {"nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+            {"matchExpressions": [{"key": "type", "operator": "NotIn", "values": ["virtual-kubelet"]}]}]}}}
         and .securityContext == {"seccompProfile": {"type": "RuntimeDefault"}}
         and .volumes == [
             {"name": "cni-conf", "hostPath": {"path": "/etc/cni/net.d", "type": "DirectoryOrCreate"}},
@@ -128,12 +131,13 @@ render "${agent[@]}" --set podNetworkAgent.admissionPolicy.enabled=false >"$tmp_
 
 render "${agent[@]}" --set podNetworkAgent.image.digest="$digest" --set 'podNetworkAgent.command={/usr/local/bin/pod-network-agent}' \
     --set podNetworkAgent.apiServer.host=cluster.example.com --set coexistence.enabled=true --set webhook.enabled=false \
-    >"$tmp_dir/options.yaml"
+    --set podNetworkAgent.maxUnavailable=10% >"$tmp_dir/options.yaml"
 agent_object "$tmp_dir/options.yaml" DaemonSet | jq -e --arg image "example.com/pod-network-agent:v0.0.0@$digest" '
-    .spec.template.spec.containers[0] | .image == $image and .command == ["/usr/local/bin/pod-network-agent"]
+    .spec.updateStrategy.rollingUpdate == {"maxSurge": 0, "maxUnavailable": "10%"}
+    and (.spec.template.spec.containers[0] | .image == $image and .command == ["/usr/local/bin/pod-network-agent"]
     and ([.env[] | {(.name): .value}] | add | .NODE_CLASS_GROUP == "multiregion.io"
-        and .KUBERNETES_SERVICE_HOST == "cluster.example.com" and .KUBERNETES_SERVICE_PORT == "443")' >/dev/null ||
-    fail "expected the image digest, the command, the API server and the node class group of coexistence mode"
+        and .KUBERNETES_SERVICE_HOST == "cluster.example.com" and .KUBERNETES_SERVICE_PORT == "443"))' >/dev/null ||
+    fail "expected maxUnavailable, the image digest, the command, the API server and the node class group of coexistence mode"
 render "${agent[@]}" --set podNetworkAgent.image.tag= --set podNetworkAgent.image.digest="$digest" >"$tmp_dir/digest.yaml"
 [[ "$(agent_object "$tmp_dir/digest.yaml" DaemonSet | jq -r '.spec.template.spec.containers[0].image')" == "example.com/pod-network-agent@$digest" ]] ||
     fail "expected an image by digest alone"

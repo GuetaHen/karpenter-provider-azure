@@ -111,7 +111,7 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 0
-      maxUnavailable: 1
+      maxUnavailable: {{ .Values.podNetworkAgent.maxUnavailable }}
   template:
     metadata:
       labels:
@@ -131,6 +131,15 @@ spec:
       priorityClassName: {{ $agent.priorityClassName | quote }}
       nodeSelector:
         kubernetes.io/os: linux
+      # Virtual nodes cannot run the agent, so it stays off them, as the AKS DaemonSets do.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values: ["virtual-kubelet"]
       # The agent must run on a node that still carries the startup taint that it removes.
       tolerations:
         - operator: Exists

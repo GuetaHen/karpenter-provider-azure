@@ -91,6 +91,32 @@ func TestCNIConfig(t *testing.T) {
 	}))
 }
 
+// TestCNIConfigBytes pins the exact bytes of the CNI configuration for one range. The agent never
+// rewrites its file and refuses a node whose file holds other bytes, so any change of these bytes,
+// even of the layout, keeps every regional node that holds the file of an earlier agent not ready and
+// tainted until the node is replaced.
+func TestCNIConfigBytes(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(string(CNIConfig(testPodRange))).To(Equal(`{
+  "cniVersion": "0.3.1",
+  "name": "karpenter-pod-network",
+  "plugins": [
+    {
+      "type": "cilium-cni",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": "10.244.3.0/24"}]]
+      }
+    },
+    {
+      "type": "tuning",
+      "mtu": 1400
+    }
+  ]
+}
+`))
+}
+
 func TestCNIEnsure(t *testing.T) {
 	g := NewWithT(t)
 	c := testCNI(t)
