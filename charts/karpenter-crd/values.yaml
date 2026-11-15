@@ -5,3 +5,7 @@ webhook:
   serviceNamespace: ""
   # -- The container port to use for the webhook.
   port: 8443
+coexistence:
+  # -- Render only the multiregion.io AKSNodeClass CRD, for a controller in coexistence mode beside another
+  # Karpenter installation that owns the other CRDs.
+  enabled: false

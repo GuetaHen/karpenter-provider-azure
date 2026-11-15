@@ -162,6 +162,12 @@ controller:
   healthProbe:
     # -- The container port to use for http health probe.
     port: 8081
+coexistence:
+  # -- Run beside another Karpenter installation that serves karpenter.azure.com AKSNodeClasses, such as AKS node
+  # auto-provisioning. The controller then serves AKSNodeClasses of the multiregion.io API group and only the NodePools
+  # and NodeClaims that reference them. Requires webhook.enabled=false. Install the multiregion.io CRD with the
+  # karpenter-crd chart and coexistence.enabled=true, and install this chart with --skip-crds.
+  enabled: false
 webhook:
   # -- Whether to enable the webhooks and webhook permissions.
   enabled: true
@@ -193,6 +199,9 @@ settings:
   clusterName: ""
   # -- Cluster endpoint.
   clusterEndpoint: ""
+  # -- Namespace of the upcoming-maintenance-window ConfigMap that gates node image upgrades (SYSTEM_NAMESPACE).
+  # AKS publishes it in kube-system. The chart grants get on it there. Defaults to the release namespace.
+  systemNamespace: ""
   # -- The VM memory overhead as a percent that will be subtracted from the total memory for all instance types
   vmMemoryOverheadPercent: 0.075
   # -- Additional tags to apply to Azure resources. These tags are merged with AKSNodeClass tags, with AKSNodeClass tags taking precedence on collisions.

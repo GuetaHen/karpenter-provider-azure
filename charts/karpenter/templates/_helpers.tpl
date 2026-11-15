@@ -65,6 +65,27 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+"true" when the controller runs in coexistence mode beside another Karpenter installation
+*/}}
+{{- define "karpenter.coexistence" -}}
+{{- if eq (dig "coexistence" "enabled" false .Values.AsMap | toString) "true" }}true{{ end }}
+{{- end }}
+
+{{/*
+API group of the AKSNodeClasses that the controller serves
+*/}}
+{{- define "karpenter.aksNodeClassGroup" -}}
+{{- if include "karpenter.coexistence" . }}multiregion.io{{ else }}karpenter.azure.com{{ end }}
+{{- end }}
+
+{{/*
+Namespace of the upcoming-maintenance-window ConfigMap, which the controller reads from SYSTEM_NAMESPACE
+*/}}
+{{- define "karpenter.systemNamespace" -}}
+{{- .Values.settings.systemNamespace | default .Release.Namespace }}
+{{- end }}
+
+{{/*
 Karpenter image to use
 */}}
 {{- define "karpenter.controller.image" -}}

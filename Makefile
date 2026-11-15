@@ -105,10 +105,11 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	hack/validation/requirements.sh
 	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
-	# Package the adjusted CRDs, then validate CapacityBuffer chart delivery
-	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
-	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	# Package the adjusted CRDs and the coexistence CRD, then validate chart delivery
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS) coexistence/multiregion.io_aksnodeclasses.yaml) charts/karpenter-crd/definitions
+	chmod u+w $(addprefix charts/karpenter-crd/definitions/,$(SUPPORTED_CRDS) multiregion.io_aksnodeclasses.yaml)
 	hack/validation/capacitybuffer.sh
+	hack/validation/coexistence-chart.sh
 	hack/github/dependabot.sh
 	$(foreach dir,$(MOD_DIRS),cd $(dir) && golangci-lint-custom run $(newline))
 	@git diff --quiet ||\

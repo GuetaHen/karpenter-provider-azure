@@ -1,0 +1,8 @@
+{{- /* Each CRD of this chart is a file in definitions/. Coexistence mode installs only the multiregion.io AKSNodeClass CRD. */}}
+{{- $coexistence := eq (dig "coexistence" "enabled" false .Values.AsMap | toString) "true" }}
+{{- range $path, $_ := .Files.Glob "definitions/*.yaml" }}
+{{- if eq $coexistence (hasPrefix "definitions/multiregion.io_" $path) }}
+---
+{{ $.Files.Get $path }}
+{{- end }}
+{{- end }}

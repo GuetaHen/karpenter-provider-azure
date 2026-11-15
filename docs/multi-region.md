@@ -265,7 +265,9 @@ community images are resolved:
   and image drift work as for non-FIPS community images: versions advance only
   while the node OS maintenance window is open. The controller reads the window
   with `get` on ConfigMap `upcoming-maintenance-window` in the namespace that
-  `SYSTEM_NAMESPACE` names; the chart sets the controller's own namespace.
+  `SYSTEM_NAMESPACE` names. The chart sets it to `settings.systemNamespace`, by
+  default the controller's own namespace, and grants that `get` there. AKS
+  publishes the ConfigMap in `kube-system`.
   Without `SYSTEM_NAMESPACE`, when the ConfigMap is missing or empty, or when it
   has neither `aksManagedNodeOSUpgradeSchedule-start` nor
   `aksManagedNodeOSUpgradeSchedule-end`, the window counts as open: versions
@@ -375,7 +377,8 @@ In coexistence mode the controller:
 - never installs or changes a CRD, and waits through API discovery until
   `multiregion.io` is served. Install
   `pkg/apis/crds/coexistence/multiregion.io_aksnodeclasses.yaml` from the same
-  revision. It serves the `v1beta1` schema of
+  revision, for example with the `karpenter-crd` chart as shown below. It serves
+  the `v1beta1` schema of
   `karpenter.azure.com_aksnodeclasses.yaml` under the new group, and a unit test
   fails when the two differ. Both installations share the `karpenter.sh`
   NodePool and NodeClaim CRDs, whose installed schemas must be compatible with
@@ -414,8 +417,22 @@ Beyond the default rules, coexistence mode needs these Kubernetes permissions:
 `get`, `list`, `watch`, `patch` and `update` on `aksnodeclasses.multiregion.io`,
 `patch` and `update` on its `status`, and `get` on
 `aksnodeclasses.karpenter.azure.com`. It needs no permission on CRDs and no write
-on `karpenter.azure.com` AKSNodeClasses. The Helm chart of this revision grants
-these rules for the default group only.
+on `karpenter.azure.com` AKSNodeClasses. The Helm charts install coexistence
+mode by values alone:
+
+1. Install or upgrade the `karpenter-crd` chart with `coexistence.enabled=true`.
+   It then renders only the `multiregion.io` CRD, which Helm applies on install
+   and on every upgrade.
+2. Install or upgrade the `karpenter` chart with `coexistence.enabled=true`,
+   `webhook.enabled=false` and `--skip-crds`. It sets `COEXISTENCE_MODE=true`
+   and grants the rules above instead of those of the default group. It refuses
+   to render with the webhooks enabled, whose rules update CRDs that both
+   installations share.
+
+Give the release a name and a namespace of its own, so that its cluster-scoped
+RBAC objects and its leader election lease differ from those of the other
+installation, and keep the default `LEADER_ELECTION_NAME`: the chart's Role
+allows lease updates only under that name.
 
 ## Node contract
 

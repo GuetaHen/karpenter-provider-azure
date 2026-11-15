@@ -29,10 +29,16 @@ metadata:
   {{- end }}
 rules:
   # Read
-  - apiGroups: ["karpenter.azure.com"]
+  - apiGroups: ["{{ include "karpenter.aksNodeClassGroup" . }}"]
     resources: ["aksnodeclasses"]
     verbs: ["get", "list", "watch"]
-  # Write
+  {{- if include "karpenter.coexistence" . }}
+  # Coexistence mode refuses an AKSNodeClass name that the other installation also uses
   - apiGroups: ["karpenter.azure.com"]
+    resources: ["aksnodeclasses"]
+    verbs: ["get"]
+  {{- end }}
+  # Write
+  - apiGroups: ["{{ include "karpenter.aksNodeClassGroup" . }}"]
     resources: ["aksnodeclasses", "aksnodeclasses/status"]
     verbs: ["patch", "update"]

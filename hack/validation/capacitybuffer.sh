@@ -170,7 +170,7 @@ core_crd="$(go list -m -f '{{.Dir}}' sigs.k8s.io/karpenter)/pkg/apis/crds/autosc
 for crd in \
     "$core_crd" \
     pkg/apis/crds/autoscaling.x-k8s.io_capacitybuffers.yaml \
-    charts/karpenter-crd/templates/autoscaling.x-k8s.io_capacitybuffers.yaml \
+    charts/karpenter-crd/definitions/autoscaling.x-k8s.io_capacitybuffers.yaml \
     charts/karpenter/crds/autoscaling.x-k8s.io_capacitybuffers.yaml; do
     storage_version="$(yq eval '.spec.versions[] | select(.storage == true) | .name' "$crd")"
     [[ "$(yq eval '.spec.group' "$crd")" == "autoscaling.x-k8s.io" && "$storage_version" == "v1beta1" ]] || {
