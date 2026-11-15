@@ -264,10 +264,10 @@ transit prefix; what it programmed before stays. A home node's peers are the
 regional nodes, and its CNI configuration stays as AKS wrote it. A regional
 node's peers are all other nodes, and there the agent also:
 
-- writes, once, a CNI configuration that sorts before every other file in
+- writes a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the
   node's `/24` (addresses `.2` to `.254`, gateway `.1`), chained with the
-  `tuning` plugin for MTU 1400; it writes nothing while an earlier file exists;
+  `tuning` plugin for MTU 1400;
 - masquerades pod traffic that leaves through the node's own interface;
 - drops forwarded traffic to `169.254.169.254`, so that pods cannot reach
   instance metadata.
@@ -275,12 +275,22 @@ node's peers are all other nodes, and there the agent also:
 A regional node offers 253 pod addresses, so a NodeClass that sets `maxPods`
 above 253 is not supported on regional nodes.
 
+The agent writes that CNI file once the node's Cilium agent is healthy, and
+only while `/etc/cni/net.d` holds no other CNI configuration: pods started with
+another configuration could hold addresses that `host-local` does not know. On
+AKS, Azure CNS writes the CNI configuration of the Cilium dataplane only after
+the Azure host reports the node's network container as programmed, and hands
+out no pod address until then. Once the agent's file is in place, a later CNI
+configuration does not matter, and an earlier one makes the node not ready.
+
 The agent re-checks a peer on every change of its Node, NodeClaim or
 `NodeNetworkConfig`, re-validates everything every 60 seconds, and removes a
 peer's route as soon as a check fails. It marks its devices with an alias,
 keeps its rules in its own nftables table and its routes under its own
 protocol and metric, and never adopts or overwrites a device, route or CNI
-file that it did not create.
+file that it did not create. When the agent stops, it leaves what it programmed
+in place: existing peers keep working, and the agent adds new peers and removes
+departed ones when it runs again.
 
 Every NodePool whose NodeClass lists regions sets the agent's startup taint,
 whose key is `podNetworkAgent.startupTaintKey`:
@@ -299,13 +309,25 @@ With the agent enabled, the chart passes the key to the controller as
 (`MULTI_REGION_POD_NETWORK_STARTUP_TAINT`, default empty). The controller then
 refuses to launch a NodeClaim of a NodeClass with `regions`, before any write,
 unless its `startupTaints` hold a `NoSchedule` or `NoExecute` taint with that
-key. The agent removes the taint from its own node once its checks pass, the
-CNI file is in place, the tunnel is programmed and the node's Cilium agent is
-healthy (`http://127.0.0.1:9879/healthz` with the header `brief: true`). It
-puts the taint back when any of that fails later, only on the Node with the UID
-it checked and unless that Node is being deleted, and its readiness probe
-reports the same state. A regional node that never becomes ready stays tainted
-until its NodeClaim is deleted; this provider has no repair policy for it.
+key. The agent removes the taint from its own node once the node no longer
+carries `karpenter.sh/unregistered`, its checks pass and the tunnel is
+programmed, and on a regional node also the node's Cilium agent is healthy
+(`http://127.0.0.1:9879/healthz` with the header `brief: true`) and the CNI file
+is in place. It puts the taint back only on a node whose NodeClaim, of this
+controller's node class group, carries the
+`karpenter.azure.com/region-placement` annotation, when any of that fails
+later, only on the Node with the UID it checked and unless that Node is being
+deleted. Its readiness probe reports the same conditions, apart from the
+registration. A regional node that never becomes ready stays tainted until its
+NodeClaim is deleted; this provider has no repair policy for it.
+
+A home NodePool may set the same startup taint, so that its new nodes take pods
+only once the agent has programmed the tunnel; the controller requires the
+taint only for NodeClaims of a NodeClass with `regions`. New nodes of such a
+pool take no pods while the agent cannot run, so roll the agent out before
+setting the taint. Adding it to an existing NodePool replaces the pool's nodes,
+because `startupTaints` is part of the NodePool's hash. Do not set it on a
+Windows NodePool, where the agent does not run.
 
 The agent runs as root with host networking but unprivileged: only the
 `NET_ADMIN` capability, no privilege escalation, a read-only root file system
