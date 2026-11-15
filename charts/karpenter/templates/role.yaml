@@ -76,6 +76,8 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["delete"]
+{{- /* With the webhooks on, the first Role already lets the controller read ConfigMaps in the release namespace. */}}
+{{- if or (not .Values.webhook.enabled) .Values.settings.systemNamespace }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -94,3 +96,4 @@ rules:
     resources: ["configmaps"]
     resourceNames: ["upcoming-maintenance-window"]
     verbs: ["get"]
+{{- end }}

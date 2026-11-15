@@ -10,7 +10,7 @@ set -euo pipefail
 #   karpenter.azure.com AKSNodeClasses instead of access to the latter, and grants
 #   no write on NodeOverlay status, which only the default render keeps; and
 # - the controller may get the maintenance-window ConfigMap in the namespace that
-#   SYSTEM_NAMESPACE names.
+#   SYSTEM_NAMESPACE names, while the default render adds no object for that.
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
@@ -88,8 +88,14 @@ jq -e '. == [
     echo "expected update and patch on nodeoverlays/status by default only, because coexistence mode never writes NodeOverlay status"
     exit 1
 }
-maintenance_window_access "$tmp_dir/default.yaml" karpenter || {
-    echo "expected get on the maintenance-window ConfigMap in the release namespace by default"
+# With the webhooks on, the controller's Role already reads ConfigMaps in the release namespace.
+[[ "$(yq eval-all -o=json 'select(.metadata.name == "karpenter-maintenance-window") | .kind' "$tmp_dir/default.yaml" | jq -s length)" == 0 ]] || {
+    echo "expected no maintenance-window Role or RoleBinding in the default render"
+    exit 1
+}
+helm template karpenter charts/karpenter --namespace karpenter --set webhook.enabled=false >"$tmp_dir/no-webhook.yaml"
+maintenance_window_access "$tmp_dir/no-webhook.yaml" karpenter || {
+    echo "expected get on the maintenance-window ConfigMap in the release namespace without the webhooks"
     exit 1
 }
 maintenance_window_access "$tmp_dir/coexistence.yaml" kube-system || {
