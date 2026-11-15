@@ -756,6 +756,14 @@ var _ = Describe("CloudProvider", func() {
 					customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
 					Expect(err).ToNot(HaveOccurred())
 					Expect(string(customData)).To(ContainSubstring(v1beta1.AKSLabelFIPSEnabled + "=true"))
+
+					// An arm64 size gets the arm64 FIPS image of its region.
+					armPod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelArchStable: karpv1.ArchitectureArm64}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, armPod)
+					ExpectScheduled(ctx, env.Client, armPod)
+					armVM := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+					Expect(lo.FromPtr(armVM.Location)).To(Equal(fake.RegionNonZonal))
+					Expect(lo.FromPtr(armVM.Properties.StorageProfile.ImageReference.CommunityGalleryImageID)).To(And(BeElementOf(remoteIDs), ContainSubstring(imagefamily.AzureLinux3Gen2Arm64FIPSImageDefinition)))
 				})
 				It("should name a region without a FIPS image instead of falling back to non-FIPS images", func() {
 					remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = fipsDefinitions()
