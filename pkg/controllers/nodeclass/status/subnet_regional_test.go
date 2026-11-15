@@ -52,3 +52,30 @@ func TestRegionalSubnetConditionNamesAnUnloadedRegion(t *testing.T) {
 	g.Expect(condition.Reason).To(Equal("RegionalCatalogUnavailable"))
 	g.Expect(condition.Message).To(ContainSubstring("westus2"))
 }
+
+type unavailableRegionsError struct{}
+
+func (unavailableRegionsError) Error() string {
+	return "regions without new nodes until their checks pass: region westus2 subnet: not found"
+}
+
+func (unavailableRegionsError) Reason() string { return "RegionsUnavailable" }
+
+func (unavailableRegionsError) UnavailableRegions() []string { return []string{"westus2"} }
+
+func TestRegionalSubnetConditionStaysTrueWhileOtherRegionsServe(t *testing.T) {
+	g := NewWithT(t)
+	nodeClass := test.AKSNodeClass()
+	nodeClass.Spec.Regions = []v1beta1.Region{{
+		Name:         "westus2",
+		VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+	}}
+	reconciler := status.NewSubnetReconciler(nil, func(context.Context, *v1beta1.AKSNodeClass) error { return unavailableRegionsError{} })
+	result, err := reconciler.Reconcile(t.Context(), nodeClass)
+	g.Expect(err).ToNot(HaveOccurred(), "the other regions serve")
+	g.Expect(result.RequeueAfter).ToNot(BeZero(), "the check repeats until the region passes")
+	condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady)
+	g.Expect(condition.IsTrue()).To(BeTrue())
+	g.Expect(condition.Reason).To(Equal("RegionsUnavailable"))
+	g.Expect(condition.Message).To(ContainSubstring("westus2"))
+}

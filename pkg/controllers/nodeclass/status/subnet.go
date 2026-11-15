@@ -39,6 +39,12 @@ type reasonedError interface {
 	Reason() string
 }
 
+// partialRegionsError names regions that get no new nodes while the NodeClass's other regions serve.
+type partialRegionsError interface {
+	reasonedError
+	UnavailableRegions() []string
+}
+
 type SubnetReconciler struct {
 	subnetClient    azapi.SubnetsAPI
 	validateRegions func(context.Context, *v1beta1.AKSNodeClass) error
@@ -75,6 +81,12 @@ func (r *SubnetReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKS
 			return reconcile.Result{}, nil
 		}
 		if err := r.validateRegions(ctx, nodeClass); err != nil {
+			// Some regions failed while the others serve: the NodeClass stays ready, and the check
+			// repeats so that the failing regions return once they pass.
+			if partial, ok := lo.ErrorsAs[partialRegionsError](err); ok {
+				nodeClass.StatusConditions().SetTrueWithReason(v1beta1.ConditionTypeSubnetsReady, partial.Reason(), err.Error())
+				return reconcile.Result{RequeueAfter: healthyRequeueInterval}, nil
+			}
 			reason := "RegionalSubnetInvalid"
 			if reasoned, ok := lo.ErrorsAs[reasonedError](err); ok {
 				reason = reasoned.Reason()

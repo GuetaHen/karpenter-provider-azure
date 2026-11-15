@@ -354,7 +354,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 				return err
 			}
 			return validator.Validate(ctx, region)
-		}).WithClock(operator.Clock)
+		}).WithClock(operator.Clock).WithKubeClient(operator.GetClient())
 		wrappedImages = &regional.Images{NodeImageProvider: imageProvider, Registry: regions}
 		wrappedTypes = &regional.InstanceTypes{Provider: instanceTypeProvider, Registry: regions}
 		wrappedVMs = &regional.Instances{VMProvider: vmInstanceProvider, Registry: regions, KubeClient: operator.GetClient()}

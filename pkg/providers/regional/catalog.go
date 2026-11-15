@@ -72,7 +72,10 @@ type InstanceTypes struct {
 }
 
 // List merges the instance types of every listed region into one catalog. A region that
-// has never loaded fails the NodeClass: a partial catalog would make core drift treat
+// failed the NodeClass's last check offers no capacity: its instance types stay with
+// unavailable offerings, so that core drift keeps its NodeClaims, or, if it has never
+// loaded, ValidateSubnets found no NodeClaims in it and it is left out. Any other region
+// that has never loaded fails the NodeClass: a partial catalog would make core drift treat
 // healthy NodeClaims in that region as having an unknown instance type.
 func (p *InstanceTypes) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]*cloudprovider.InstanceType, error) {
 	if len(nodeClass.Spec.Regions) == 0 {
@@ -83,13 +86,20 @@ func (p *InstanceTypes) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClas
 	}
 	inputs := make([]regionTypes, 0, len(nodeClass.Spec.Regions))
 	for _, region := range nodeClass.Spec.Regions {
+		unavailable := p.Registry.isUnavailable(nodeClass.UID, region.Name)
 		provider, err := p.Registry.get(ctx, region.Name)
 		if err != nil {
+			if unavailable {
+				continue
+			}
 			return nil, err
 		}
 		listed, err := provider.Types.List(ctx, nodeClass)
 		if err != nil {
 			return nil, fmt.Errorf("region %s instance types: %w", region.Name, err)
+		}
+		if unavailable {
+			listed = p.Registry.catalogs.withoutCapacity(nodeClass.UID, region.Name, listed)
 		}
 		inputs = append(inputs, regionTypes{region: region.Name, types: listed})
 	}
@@ -113,6 +123,13 @@ type catalogCache struct {
 	mu       sync.Mutex
 	catalogs map[types.UID]*catalog
 	changes  *pretty.ChangeMonitor
+
+	// unavailable reuses the capacity-free copies of a failing region's instance types.
+	unavailable map[string]unavailableTypes
+}
+
+type unavailableTypes struct {
+	listed, copies []*cloudprovider.InstanceType
 }
 
 func (c *catalogCache) get(ctx context.Context, uid types.UID, inputs []regionTypes) []*cloudprovider.InstanceType {
@@ -135,6 +152,32 @@ func (c *catalogCache) get(ctx context.Context, uid types.UID, inputs []regionTy
 
 func sameRegionTypes(a, b regionTypes) bool {
 	return a.region == b.region && slices.Equal(a.types, b.types)
+}
+
+// withoutCapacity returns copies of a failing region's instance types whose offerings are
+// unavailable: core drift still finds the instance types of the region's NodeClaims, and no new
+// node is placed there. The copies are reused while the region lists the same instance types,
+// so that the merged catalog stays cached.
+func (c *catalogCache) withoutCapacity(uid types.UID, region string, listed []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+	key := string(uid) + "/" + region
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cached, ok := c.unavailable[key]; ok && slices.Equal(cached.listed, listed) {
+		return cached.copies
+	}
+	copies := make([]*cloudprovider.InstanceType, 0, len(listed))
+	for _, it := range listed {
+		copied := it.DeepCopy()
+		for _, offering := range copied.Offerings {
+			offering.Available = false
+		}
+		copies = append(copies, copied)
+	}
+	if c.unavailable == nil || len(c.unavailable) >= maxCachedCatalogs {
+		c.unavailable = map[string]unavailableTypes{}
+	}
+	c.unavailable[key] = unavailableTypes{listed: listed, copies: copies}
+	return copies
 }
 
 // merge combines each SKU's offerings across regions. The first listed region that

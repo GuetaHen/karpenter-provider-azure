@@ -67,6 +67,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
@@ -481,7 +482,11 @@ var _ = Describe("CloudProvider", func() {
 		Context("Multi-region", func() {
 			var remote *test.Environment
 			var regionalImages *regional.Images
+			var registry *regional.Registry
+			// regionErrs fails the subnet check of a region.
+			var regionErrs map[string]error
 			BeforeEach(func() {
+				regionErrs = map[string]error{}
 				testOptions.NetworkPlugin = consts.NetworkPluginNone
 				testOptions.NetworkPluginMode = ""
 				testOptions.ComputeRecommendationMode = consts.ComputeRecommendationModeDisabled
@@ -492,14 +497,14 @@ var _ = Describe("CloudProvider", func() {
 					azureEnv.LoadBalancerProvider, azureEnv.NetworkSecurityGroupProvider, remote.UnavailableOfferingsCache,
 					fake.RegionNonZonal, testOptions.NodeResourceGroup, azureEnv.SubscriptionID, testOptions.ProvisionMode, "",
 					lo.Must(auth.EnvironmentFromName("AzurePublicCloud")), remote.QuotaProvider)
-				registry := regional.New(fake.Region, &regional.Providers{
+				registry = regional.New(fake.Region, &regional.Providers{
 					Types: azureEnv.InstanceTypesProvider, Images: azureEnv.ImageProvider, Instances: azureEnv.VMInstanceProvider, Quota: azureEnv.QuotaProvider,
 				}, func(region string) *regional.Providers {
 					Expect(region).To(Equal(fake.RegionNonZonal))
 					return &regional.Providers{Types: remote.InstanceTypesProvider, Images: remote.ImageProvider, Instances: remoteVMs, Quota: remote.QuotaProvider}
 				}, func(_ context.Context, region v1beta1.Region) error {
 					Expect(region.Name).To(BeElementOf(fake.Region, fake.RegionNonZonal))
-					return nil
+					return regionErrs[region.Name]
 				}).WithClock(fakeClock)
 				regionalTypes := &regional.InstanceTypes{Provider: azureEnv.InstanceTypesProvider, Registry: registry}
 				regionalImages = &regional.Images{NodeImageProvider: azureEnv.ImageProvider, Registry: registry}
@@ -867,6 +872,66 @@ var _ = Describe("CloudProvider", func() {
 				remote.SKUsAPI.Error = errors.New("synthetic SKU outage")
 				_, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
 				Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal + " has no SKU catalog yet")))
+			})
+			It("should keep provisioning in the other regions while a region without NodeClaims fails its checks", func() {
+				registry.WithKubeClient(env.Client)
+				regionErrs[fake.RegionNonZonal] = errors.New("synthetic subnet outage")
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				err := registry.ValidateSubnets(ctx, nodeClass)
+				Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal + " subnet: synthetic subnet outage")))
+				var partial interface{ UnavailableRegions() []string }
+				Expect(errors.As(err, &partial)).To(BeTrue())
+				Expect(partial.UnavailableRegions()).To(ConsistOf(fake.RegionNonZonal))
+				instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).ToNot(HaveOccurred())
+				remoteOfferings := 0
+				for _, instanceType := range instanceTypes {
+					for _, offering := range instanceType.Offerings {
+						if offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.RegionNonZonal) {
+							remoteOfferings++
+							Expect(offering.Available).To(BeFalse(), "%s in the failing region", instanceType.Name)
+						}
+					}
+				}
+				Expect(remoteOfferings).ToNot(BeZero(), "the failing region keeps its instance types for core drift")
+				pod := coretest.UnschedulablePod()
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.Region))
+
+				delete(regionErrs, fake.RegionNonZonal)
+				Expect(registry.ValidateSubnets(ctx, nodeClass)).To(Succeed())
+				instanceTypes, err = cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(lo.ContainsBy(instanceTypes, func(instanceType *corecloudprovider.InstanceType) bool {
+					return lo.ContainsBy(instanceType.Offerings.Available(), func(offering *corecloudprovider.Offering) bool {
+						return offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.RegionNonZonal)
+					})
+				})).To(BeTrue(), "the region serves again once it passes")
+			})
+			It("should garbage collect the VM of a removed region", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				Expect(lo.FromPtr(input.VM.Location)).To(Equal(fake.RegionNonZonal))
+				// The region leaves the NodeClass, and its NodeClaim is gone while its VM is past the grace period.
+				nodeClass.Spec.Regions = nodeClass.Spec.Regions[:1]
+				ExpectApplied(ctx, env.Client, nodeClass)
+				nodeClaims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+				Expect(nodeClaims.Items).To(HaveLen(1))
+				ExpectFinalizersRemoved(ctx, env.Client, &nodeClaims.Items[0])
+				ExpectDeleted(ctx, env.Client, &nodeClaims.Items[0])
+				stored, err := azureEnv.VirtualMachinesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				vm := stored.VirtualMachine
+				vm.Properties.TimeCreated = lo.ToPtr(time.Now().Add(-10 * time.Minute))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), vm)
+				ExpectSingletonReconciled(ctx, garbagecollection.NewInstance(env.Client, cloudProvider, fakeClock))
+				_, found := azureEnv.VirtualMachinesAPI.Instances.Load(lo.FromPtr(vm.ID))
+				Expect(found).To(BeFalse(), "the VM of the removed region is deleted")
 			})
 			It("should reject spec.regions before any Azure write when multi-region provisioning is disabled", func() {
 				testOptions.EnableMultiRegion = false

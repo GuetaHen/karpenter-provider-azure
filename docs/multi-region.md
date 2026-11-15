@@ -307,7 +307,24 @@ regions, or recasing a subnet ID, does not replace nodes whose recorded region
 and subnet are still listed. A NodeClaim drifts with reason
 `RegionalPlacementDrift` only when its own region or subnet is removed, when
 `regions` is removed from the NodeClass, or when `regions` is added to a
-NodeClass that still has single-region nodes.
+NodeClass that still has single-region nodes. Core replaces drifted nodes within
+the NodePool's disruption budgets, so removing a region replaces its nodes like
+any other drift. Instance garbage collection lists the whole node resource
+group, so it also deletes the VM of a removed region whose NodeClaim is gone.
+
+A failing region does not block the others. Every three minutes the subnet
+status check tests each listed region: its subnet, its SKU catalog and, once
+the NodeClass status lists node images, an image for it. A failing region gets
+no new nodes. Its instance types stay in the catalog with unavailable
+offerings, so core drift keeps its NodeClaims; a region that has never loaded
+and has no NodeClaims is left out. `SubnetsReady` stays `True` with reason
+`RegionsUnavailable` and names the failing regions, and a region serves again
+once it passes. The NodeClass is not ready only while every listed region
+fails, or while a region that has never loaded its SKU catalog has NodeClaims
+(reason `RegionalCatalogUnavailable`). Image resolution leaves out a failing
+region that the status has no image for, so that the images of the other
+regions keep refreshing; a region whose images are in use keeps them through a
+failure.
 
 Regional state is never borrowed from another region. The first use of a
 region loads its SKUs and quota; later requests refresh SKUs after 12 hours and
@@ -317,7 +334,8 @@ refresh fails, so core drift never reports its healthy NodeClaims as
 `InstanceTypeNotFound`. Its quota is served until it is 15 minutes old and is
 then cleared so that it fails open, exactly like the home region. A region that
 has never loaded fails instance-type listing for the whole NodeClass instead of
-returning a partial catalog. If a SKU's capacity, overhead or capabilities
+returning a partial catalog while it has NodeClaims (see above). If a SKU's
+capacity, overhead or capabilities
 differ between regions, the first listed region that offers it is
 authoritative: the other region's offerings for that SKU are excluded, logged
 once per change and counted in
