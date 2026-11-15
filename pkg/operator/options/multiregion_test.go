@@ -75,6 +75,23 @@ var _ = Describe("Multi-region overlay and identity options", func() {
 		Expect(opts.ValidateMultiRegionOptions()).To(MatchError(ContainSubstring("network-plugin-mode overlay")))
 	})
 
+	It("reads the pod network startup taint and accepts only a taint key with the external pod network", func() {
+		Expect(os.Setenv("MULTI_REGION_POD_NETWORK_STARTUP_TAINT", "karpenter.azure.com/regional-pod-network-not-ready")).To(Succeed())
+		DeferCleanup(os.Unsetenv, "MULTI_REGION_POD_NETWORK_STARTUP_TAINT")
+		fs := &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+		parsed := &options.Options{}
+		parsed.AddFlags(fs)
+		Expect(fs.Parse(nil)).To(Succeed())
+		Expect(parsed.MultiRegionPodNetworkStartupTaint).To(Equal("karpenter.azure.com/regional-pod-network-not-ready"))
+		// Validate options built here: parsed options also take the network plugin settings from the process environment.
+		opts := &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginAzure, NetworkPluginMode: consts.NetworkPluginModeOverlay, EnableMultiRegion: true, MultiRegionPodNetworkStartupTaint: parsed.MultiRegionPodNetworkStartupTaint}
+		Expect(opts.ValidateMultiRegionOptions()).To(MatchError(ContainSubstring("requires multi-region-external-pod-network")))
+		opts.MultiRegionExternalPodNetwork = true
+		Expect(opts.ValidateMultiRegionOptions()).To(Succeed())
+		opts.MultiRegionPodNetworkStartupTaint = "regional pod network"
+		Expect(opts.ValidateMultiRegionOptions()).To(MatchError(ContainSubstring("must be a taint key")))
+	})
+
 	It("replaces the global identities only for regions with an entry", func() {
 		opts := &options.Options{EnableMultiRegion: true, NodeIdentities: []string{identityID("global")}, KubeletIdentityClientID: "61f71907-753f-4802-a901-47361c3664f2"}
 		opts.SetMultiRegionNodeIdentitiesJSON("{" + identitiesJSON("WestUS2", identityID("west"), regionalClientID) + "}")

@@ -1054,6 +1054,38 @@ var _ = Describe("CloudProvider", func() {
 				Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
 				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
 			})
+			DescribeTable("should refuse a regional NodeClaim without the pod network startup taint before any write",
+				func(taints []v1.Taint) {
+					const key = "karpenter.azure.com/regional-pod-network-not-ready"
+					testOptions.NetworkPlugin, testOptions.NetworkPluginMode = consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay
+					testOptions.MultiRegionExternalPodNetwork, testOptions.MultiRegionPodNetworkStartupTaint = true, key
+					nodePool.Spec.Template.Spec.StartupTaints = taints
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectNotScheduled(ctx, env.Client, pod)
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+					claims := &karpv1.NodeClaimList{}
+					Expect(env.Client.List(ctx, claims)).To(Succeed())
+					Expect(claims.Items).To(HaveLen(1))
+					Expect(claims.Items[0].Annotations).ToNot(HaveKey(regional.PlacementAnnotation))
+					_, err := cloudProvider.Create(ctx, &claims.Items[0])
+					Expect(err).To(MatchError(ContainSubstring(key)))
+				},
+				Entry("without startup taints", nil),
+				Entry("with a PreferNoSchedule taint of that key", []v1.Taint{{Key: "karpenter.azure.com/regional-pod-network-not-ready", Effect: v1.TaintEffectPreferNoSchedule}}),
+			)
+			It("should launch a regional NodeClaim that carries the pod network startup taint", func() {
+				testOptions.NetworkPlugin, testOptions.NetworkPluginMode = consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay
+				testOptions.MultiRegionExternalPodNetwork = true
+				testOptions.MultiRegionPodNetworkStartupTaint = "karpenter.azure.com/regional-pod-network-not-ready"
+				nodePool.Spec.Template.Spec.StartupTaints = []v1.Taint{{Key: testOptions.MultiRegionPodNetworkStartupTaint, Effect: v1.TaintEffectNoSchedule}}
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.RegionNonZonal))
+			})
 			It("should report placement drift through the NodeClass drift checks", func() {
 				nodeClaim.Status.ProviderID = "azure:///subscriptions/synthetic/resourceGroups/synthetic/providers/Microsoft.Compute/virtualMachines/synthetic"
 				nodeClaim.Annotations = map[string]string{regional.PlacementAnnotation: string(lo.Must(json.Marshal(nodeClass.Spec.Regions[1])))}

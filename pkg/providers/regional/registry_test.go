@@ -376,6 +376,40 @@ func TestPlacementConflictStopsBeforeAzureMutation(t *testing.T) {
 	g.Expect(home.Instances.(*testVMs).calls + remote.Instances.(*testVMs).calls).To(BeZero())
 }
 
+func TestRegionalLaunchRequiresThePodNetworkStartupTaint(t *testing.T) {
+	g := NewWithT(t)
+	const key = "karpenter.azure.com/regional-pod-network-not-ready"
+	ctx := options.ToContext(t.Context(), &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginAzure,
+		NetworkPluginMode: consts.NetworkPluginModeOverlay, EnableMultiRegion: true, MultiRegionExternalPodNetwork: true, MultiRegionPodNetworkStartupTaint: key})
+	home, remote := testProviders("eastus2", .4), testProviders("westus2", .2)
+	registry := New("eastus2", home, func(string) *Providers { return remote }, func(context.Context, v1beta1.Region) error { return nil })
+	claim := &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "regional-claim", UID: "synthetic-uid"}}
+	kube := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithObjects(claim).Build()
+	vm := &Instances{VMProvider: home.Instances, Registry: registry, KubeClient: kube}
+	types, err := (&InstanceTypes{Provider: home.Types, Registry: registry}).List(ctx, testClass())
+	g.Expect(err).ToNot(HaveOccurred())
+	for _, taints := range [][]corev1.Taint{nil, {{Key: key, Effect: corev1.TaintEffectPreferNoSchedule}}, {{Key: "example.com/other", Effect: corev1.TaintEffectNoSchedule}}} {
+		claim.Spec.StartupTaints = taints
+		_, err = vm.BeginCreate(ctx, testClass(), claim, types)
+		g.Expect(err).To(MatchError(ContainSubstring(key)))
+	}
+	stored := &karpv1.NodeClaim{}
+	g.Expect(kube.Get(ctx, client.ObjectKeyFromObject(claim), stored)).To(Succeed())
+	g.Expect(stored.Annotations).ToNot(HaveKey(PlacementAnnotation), "the check runs before any write")
+	g.Expect(home.Instances.(*testVMs).calls + remote.Instances.(*testVMs).calls).To(BeZero())
+
+	claim.Spec.StartupTaints = []corev1.Taint{{Key: key, Effect: corev1.TaintEffectNoSchedule}}
+	_, err = vm.BeginCreate(ctx, testClass(), claim, types)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(remote.Instances.(*testVMs).calls).To(Equal(1))
+
+	homeClass := testClass()
+	homeClass.Spec.Regions = nil
+	_, err = vm.BeginCreate(ctx, homeClass, &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "home-claim"}}, types)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(home.Instances.(*testVMs).calls).To(Equal(1), "home NodeClaims need no startup taint")
+}
+
 func TestDeleteDoesNotRequireRegionConfigurationOrRefresh(t *testing.T) {
 	g := NewWithT(t)
 	home, remote := testProviders("eastus2", .4), testProviders("westus2", .2)
