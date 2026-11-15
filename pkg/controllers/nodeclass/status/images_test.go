@@ -18,6 +18,7 @@ package status_test
 
 import (
 	"context"
+	stderrors "errors"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -31,9 +32,13 @@ import (
 
 	opstatus "github.com/awslabs/operatorpkg/status"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/client-go/kubernetes"
 	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -564,8 +569,9 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 
 		Context("with --community-gallery-fips-images", func() {
 			const (
-				fipsVersion      = "202610.30.1"
-				newerFIPSVersion = "202611.06.0"
+				fipsVersion       = "202610.30.1"
+				newerFIPSVersion  = "202611.06.0"
+				newestFIPSVersion = "202611.13.0"
 			)
 			fipsDefinitions := func() []string {
 				family := imagefamily.GetImageFamily(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, false, testK8sVersion, nil)
@@ -608,6 +614,34 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 					Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC))},
 				})
 				azureEnv.NodeImagesCache.Flush()
+			}
+			// withFIPSImagesExcept makes the region list the FIPS images of every image definition except unlisted.
+			withFIPSImagesExcept := func(unlisted ...string) {
+				azureEnv.CommunityImageVersionsAPI.NotFoundImageDefinitions = unlisted
+				azureEnv.NodeImagesCache.Flush()
+			}
+			// publishFIPSImages publishes the FIPS images at the named version on the given day of November 2026.
+			publishFIPSImages := func(name string, day int) {
+				azureEnv.CommunityImageVersionsAPI.ImageVersions.Append(&armcompute.CommunityGalleryImageVersion{
+					Name:       lo.ToPtr(name),
+					Properties: &armcompute.CommunityGalleryImageVersionProperties{PublishedDate: lo.ToPtr(time.Date(2026, 11, day, 0, 0, 0, 0, time.UTC))},
+				})
+				azureEnv.NodeImagesCache.Flush()
+			}
+			// unreadableWindow is a cluster in which the maintenance window ConfigMap cannot be read.
+			unreadableWindow := func() kubernetes.Interface {
+				kube := kubernetesfake.NewClientset()
+				kube.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(corev1.Resource("configmaps"), "upcoming-maintenance-window", stderrors.New("access denied"))
+				})
+				return kube
+			}
+			// incompleteWindow is a cluster whose maintenance window ConfigMap has a start but no end.
+			incompleteWindow := func() kubernetes.Interface {
+				return kubernetesfake.NewClientset(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
+					Data:       map[string]string{"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339)},
+				})
 			}
 
 			BeforeEach(func() {
@@ -698,7 +732,94 @@ var _ = Describe("NodeClass NodeImage Status Controller", func() {
 				Expect(err).ToNot(HaveOccurred())
 				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
 				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(newerFIPSVersion)))
+
+				// The update is complete, so the maintenance window governs the images again.
+				withoutFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				publishFIPSImages(newestFIPSVersion, 13)
+				withFIPSImagesExcept()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(newerFIPSVersion)))
 			})
+
+			It("keeps the images in use while the FIPS image definitions return one at a time outside the maintenance window", func() {
+				reconciler := closedWindowReconciler()
+				_, err := reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(fipsVersion)))
+				inUse := nodeClass.DeepCopy().Status.Images
+
+				withoutFIPSImages()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+
+				publishFIPSImages(newerFIPSVersion, 6)
+				definitions := fipsDefinitions()
+				for i, definition := range definitions {
+					// The region lists the first i+1 image definitions, at newerFIPSVersion.
+					withFIPSImagesExcept(definitions[i+1:]...)
+					_, err = reconciler.Reconcile(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue(), "after %s returned", definition)
+					Expect(nodeClass.Status.Images).To(ConsistOf(inUse), "after %s returned", definition)
+				}
+			})
+
+			It("lists a skipped image definition at its newest version when it returns after a pending update", func() {
+				reconciler := closedWindowReconciler()
+				_, err := reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+
+				// A Kubernetes upgrade requests the newest images while the region lists only the first image definition.
+				nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "KubernetesUpgrade", "Performing kubernetes upgrade, need to get latest images")
+				publishFIPSImages(newerFIPSVersion, 6)
+				withFIPSImagesExcept(fipsDefinitions()[1:]...)
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(newerFIPSVersion)[0]))
+
+				withFIPSImagesExcept()
+				_, err = reconciler.Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(statusImageIDs()).To(ConsistOf(fipsImageIDs(newerFIPSVersion)))
+			})
+
+			It("changes no image of a ready NodeClass while the maintenance window cannot be read, as before", func() {
+				_, err := closedWindowReconciler().Reconcile(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				ready := nodeClass.DeepCopy()
+
+				withNewerFIPSImages()
+				_, err = status.NewNodeImageReconciler(azureEnv.ImageProvider, unreadableWindow(), "kube-system").Reconcile(ctx, nodeClass)
+				Expect(err).To(MatchError(ContainSubstring("forbidden")))
+				Expect(nodeClass.Status).To(Equal(ready.Status))
+			})
+
+			DescribeTable("keeps the images in use and becomes ready when the FIPS images return while the maintenance window cannot be determined",
+				func(maintenanceWindow func() kubernetes.Interface, problem string) {
+					_, err := closedWindowReconciler().Reconcile(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					inUse := nodeClass.DeepCopy().Status.Images
+
+					withoutFIPSImages()
+					_, err = closedWindowReconciler().Reconcile(ctx, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+
+					withNewerFIPSImages()
+					_, err = status.NewNodeImageReconciler(azureEnv.ImageProvider, maintenanceWindow(), "kube-system").Reconcile(ctx, nodeClass)
+					Expect(err).To(MatchError(And(ContainSubstring("checking maintenance window"), ContainSubstring(problem))))
+					Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue())
+					Expect(nodeClass.Status.Images).To(Equal(inUse))
+				},
+				Entry("when the ConfigMap cannot be read", unreadableWindow, "forbidden"),
+				Entry("when the ConfigMap is incomplete", incompleteWindow, "incomplete maintenance window data"),
+			)
 		})
 	})
 })

@@ -175,6 +175,12 @@ var _ = Describe("NodeImageProvider tests", func() {
 				Expect(strings.ToLower(image.ID)).To(ContainSubstring("fips"))
 			}
 			Expect(cacheExpiration()).To(BeTemporally(">", time.Now().Add(imagefamily.ImageExpirationInterval-time.Hour)))
+			// The status controller keeps the image of a skipped image definition only for these definitions.
+			bases, err := imagefamily.CommunityGalleryFIPSImageBases(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(bases).To(Equal(lo.Map(images, func(image imagefamily.NodeImage, _ int) string {
+				return strings.TrimSuffix(image.ID, "/versions/"+laterCIGImageVersion)
+			})))
 		})
 
 		It("never selects a placeholder or excluded version, even a newer one", func() {
@@ -217,9 +223,11 @@ var _ = Describe("NodeImageProvider tests", func() {
 		It("lists no FIPS images without the option, as before, or for Ubuntu", func() {
 			testOptions.CommunityGalleryFIPSImages = false
 			Expect(nodeImageProvider.List(ctx, nodeClass)).To(BeEmpty())
+			Expect(imagefamily.CommunityGalleryFIPSImageBases(ctx, nodeClass)).To(BeNil())
 			testOptions.CommunityGalleryFIPSImages = true
 			nodeClass.Spec.ImageFamily = lo.ToPtr(v1beta1.UbuntuImageFamily)
 			Expect(nodeImageProvider.List(ctx, nodeClass)).To(BeEmpty())
+			Expect(imagefamily.CommunityGalleryFIPSImageBases(ctx, nodeClass)).To(BeNil())
 		})
 	})
 

@@ -68,6 +68,23 @@ func listsSIGImageDefinitions(ctx context.Context, nodeClass *v1beta1.AKSNodeCla
 	return opts.UseSIG || listsCommunityGalleryFIPSImages(opts, nodeClass)
 }
 
+// CommunityGalleryFIPSImageBases returns the image IDs without version, that is gallery and image definition, of the
+// community gallery FIPS images that List resolves for nodeClass where a region publishes them, or nil when List does
+// not resolve community gallery FIPS images for nodeClass.
+func CommunityGalleryFIPSImageBases(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]string, error) {
+	if !listsCommunityGalleryFIPSImages(options.FromContext(ctx), nodeClass) {
+		return nil, nil
+	}
+	kubernetesVersion, err := nodeClass.GetKubernetesVersion()
+	if err != nil {
+		return nil, err
+	}
+	supportedImages := getSupportedImages(nodeClass.Spec.ImageFamily, nodeClass.Spec.FIPSMode, kubernetesVersion, listsSIGImageDefinitions(ctx, nodeClass), nodeClass.IsTrustedLaunchEnabled(), nodeClass.IsKataEnabled())
+	return lo.Map(supportedImages, func(image types.DefaultImageOutput, _ int) string {
+		return strings.TrimSuffix(BuildImageIDCIG(image.PublicGalleryURL, image.ImageDefinition, ""), "/versions/")
+	}), nil
+}
+
 // FIPSImagesNotFoundError reports a region in which the public community gallery has no usable version
 // of any FIPS image definition that a NodeClass needs.
 type FIPSImagesNotFoundError struct {

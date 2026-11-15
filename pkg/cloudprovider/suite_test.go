@@ -39,6 +39,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/record"
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -762,6 +763,49 @@ var _ = Describe("CloudProvider", func() {
 							Expect(err).ToNot(HaveOccurred())
 							Expect(drift).To(Equal(ImageDrift), "%s in %s", others[i], placement.region)
 						}
+					}
+				})
+				It("should keep the FIPS images in use, without drift, while a region's image definitions return one at a time outside the maintenance window", func() {
+					reconciler := status.NewNodeImageReconciler(regionalImages, kubernetesfake.NewClientset(&v1.ConfigMap{
+						ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
+						Data: map[string]string{
+							"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339),
+							"aksManagedNodeOSUpgradeSchedule-end":   time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+						},
+					}), "kube-system")
+					reconcileImages := func() {
+						GinkgoHelper()
+						remote.NodeImagesCache.Flush()
+						_, err := reconciler.Reconcile(ctx, nodeClass)
+						Expect(err).ToNot(HaveOccurred())
+					}
+					reconcileImages()
+					inUse := nodeClass.DeepCopy().Status.Images
+					expectNoDrift := func(step string) {
+						GinkgoHelper()
+						Expect(nodeClass.StatusConditions().IsTrue(v1beta1.ConditionTypeImagesReady)).To(BeTrue(), step)
+						Expect(nodeClass.Status.Images).To(ConsistOf(inUse), step)
+						nodeClaim.Labels[v1.LabelTopologyRegion] = fake.RegionNonZonal
+						for _, id := range fipsImageIDs("202610.30.1") {
+							nodeClaim.Status.ImageID = id
+							drift, err := cloudProvider.isImageVersionDrifted(ctx, nodeClaim, nodeClass)
+							Expect(err).ToNot(HaveOccurred())
+							Expect(drift).To(BeEmpty(), "%s: %s", step, id)
+						}
+					}
+					expectNoDrift("before")
+
+					definitions := fipsDefinitions()
+					remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions
+					reconcileImages()
+					Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason).To(Equal(imagefamily.FIPSImagesNotFoundReason))
+					Expect(nodeClass.Status.Images).To(ConsistOf(inUse))
+
+					remote.CommunityImageVersionsAPI.ImageVersions.Append(communityVersion("202611.06.0", time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)))
+					for i, definition := range definitions {
+						remote.CommunityImageVersionsAPI.NotFoundImageDefinitions = definitions[i+1:]
+						reconcileImages()
+						expectNoDrift(definition + " returned")
 					}
 				})
 			})

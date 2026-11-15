@@ -226,20 +226,39 @@ community images are resolved:
   types that only it serves (for example arm64) cannot launch in that region;
   restrict `kubernetes.io/arch` and `karpenter.azure.com/sku-hyperv-generation`
   in the NodePool if that matters. A listing that skipped a definition is
-  cached for five minutes instead of three days. While a definition is skipped,
-  nodes in that region that run its image count as drifted, and it returns at
-  its newest version.
+  cached for five minutes instead of three days.
+- A definition that a region stops listing keeps its image there until it is
+  listed again, so nodes on it do not drift and new nodes still get it; then
+  the maintenance window governs its update like any other. The image is not
+  kept once the NodeClass no longer selects the definition (for example after
+  an image family change), once the region leaves `regions`, or during a
+  pending update (a new NodeClass, a Kubernetes upgrade); the definition then
+  returns at its newest version. A definition withdrawn from a region for good
+  keeps its last image there until one of these happens, and launches that
+  need it fail there once that image version is deleted.
 - A region with none of the definitions sets `ImagesReady=False` with reason
   `FIPSImagesNotFound` and a message that names the region. Ready images are
   kept, so existing nodes do not drift, and once every region lists its FIPS
-  images again the maintenance window still governs their update. The images of
-  a pending update (a new NodeClass, a Kubernetes upgrade) are dropped instead,
-  so that the update completes then.
+  images again the maintenance window still governs their update. If the
+  window cannot be determined then, the images in use stay, `ImagesReady`
+  becomes `True`, and the error is logged and retried. The images of a pending
+  update (a new NodeClass, a Kubernetes upgrade) are dropped instead, so that
+  the update completes then.
 - Other image families report reason `CommunityGalleryFIPSImagesUnavailable`:
   the Ubuntu community gallery lists a FIPS definition whose only version is a
   placeholder.
 - Nodes get `kubernetes.azure.com/fips_enabled=true`. Image version maintenance
-  and image drift work as for non-FIPS community images.
+  and image drift work as for non-FIPS community images: versions advance only
+  while the node OS maintenance window is open. The controller reads the window
+  with `get` on ConfigMap `upcoming-maintenance-window` in the namespace that
+  `SYSTEM_NAMESPACE` names; the chart sets the controller's own namespace.
+  Without `SYSTEM_NAMESPACE`, when the ConfigMap is missing or empty, or when it
+  has neither `aksManagedNodeOSUpgradeSchedule-start` nor
+  `aksManagedNodeOSUpgradeSchedule-end`, the window counts as open: versions
+  advance as soon as a newer one is listed, and nodes on older versions drift.
+  When the window cannot be determined (the read is forbidden, only one of the
+  two entries is set, or a time does not parse), the images of a ready NodeClass
+  do not change, not even for a region added to `regions`, until it can.
 - The option has no effect with `USE_SIG=true`.
 
 `ENABLE_FIPS=true` selects no images. It requires `fipsMode: FIPS` on every
