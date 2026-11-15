@@ -123,6 +123,6 @@ var _ = Describe("Multi-region overlay and identity options", func() {
 		Expect(opts.ValidateCoexistence()).To(HaveOccurred())
 		opts.ManageExistingAKSMachines = false
 		Expect(opts.ValidateCoexistence()).To(Succeed())
-		Expect(options.ValidateCoexistenceFeatureGates(true, true)).To(Succeed(), "the feature gates are restricted only in coexistence mode")
+		Expect(options.ValidateCoexistenceFeatureGates(true)).To(Succeed(), "the feature gates are restricted only in coexistence mode")
 	})
 })

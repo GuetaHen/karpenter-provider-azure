@@ -392,9 +392,13 @@ In coexistence mode the controller:
   `--additional-tags` entries that would forge these tags or match another
   installation's listings are dropped.
 - does not start with an AKS Machine API `PROVISION_MODE`, with
-  `MANAGE_EXISTING_AKS_MACHINES=true`, or with the `NodeOverlay` or
-  `CapacityBuffer` feature gate on, because both installations would reconcile
-  those cluster-wide objects.
+  `MANAGE_EXISTING_AKS_MACHINES=true`, or with the `CapacityBuffer` feature
+  gate on, because both installations would reconcile those cluster-wide
+  objects.
+- applies NodeOverlays to its own NodePools when the `NodeOverlay` feature gate
+  is on, as its own validation decides, but never writes their status: the
+  other installation validates the same overlays and owns it. It logs an
+  overlay that fails its validation.
 
 Give each `multiregion.io` AKSNodeClass a name that no `karpenter.azure.com`
 AKSNodeClass has. A controller outside coexistence mode resolves a NodeClaim's

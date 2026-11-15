@@ -148,11 +148,12 @@ func (o *Options) ValidateHomeLocation(home string) error {
 	return nil
 }
 
-// ValidateCoexistenceFeatureGates rejects, in coexistence mode, core features whose
-// cluster-wide objects both controllers would reconcile.
-func ValidateCoexistenceFeatureGates(nodeOverlay, capacityBuffer bool) error {
-	if coexistence.Enabled() && (nodeOverlay || capacityBuffer) {
-		return fmt.Errorf("%s=true requires the NodeOverlay and CapacityBuffer feature gates to be disabled, because both controllers would reconcile their cluster-wide objects", coexistence.EnvVar)
+// ValidateCoexistenceFeatureGates rejects, in coexistence mode, the CapacityBuffer feature: both
+// controllers would provision for the same CapacityBuffers and write their status. NodeOverlay is
+// allowed because the operator keeps the core controllers from writing NodeOverlay status.
+func ValidateCoexistenceFeatureGates(capacityBuffer bool) error {
+	if coexistence.Enabled() && capacityBuffer {
+		return fmt.Errorf("%s=true requires the CapacityBuffer feature gate to be disabled, because both controllers would reconcile CapacityBuffers", coexistence.EnvVar)
 	}
 	return nil
 }

@@ -139,7 +139,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 
 	log.FromContext(ctx).V(0).Info("Initial AZConfig", "azConfig", azConfig.String())
 
-	lo.Must0(options.ValidateCoexistenceFeatureGates(coreoptions.FromContext(ctx).FeatureGates.NodeOverlay, coreoptions.FromContext(ctx).FeatureGates.CapacityBuffer), "validating coexistence mode")
+	lo.Must0(options.ValidateCoexistenceFeatureGates(coreoptions.FromContext(ctx).FeatureGates.CapacityBuffer), "validating coexistence mode")
 	lo.Must0(options.FromContext(ctx).ValidateHomeLocation(azConfig.Location), "validating multi-region options")
 
 	env, err := auth.ResolveCloudEnvironment(azConfig)

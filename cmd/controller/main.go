@@ -75,7 +75,7 @@ func main() {
 			ctx,
 			op.Manager,
 			op.Clock,
-			op.GetClient(),
+			operator.CoreControllerClient(op.GetClient()),
 			op.EventRecorder,
 			cloudProvider,
 			overlayUndecoratedCloudProvider,

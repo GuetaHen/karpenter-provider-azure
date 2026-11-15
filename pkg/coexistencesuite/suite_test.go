@@ -44,8 +44,12 @@ import (
 	"k8s.io/client-go/tools/record"
 	clock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	karpv1alpha1 "sigs.k8s.io/karpenter/pkg/apis/v1alpha1"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
+	"sigs.k8s.io/karpenter/pkg/controllers/state"
 	"sigs.k8s.io/karpenter/pkg/events"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
@@ -68,6 +72,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/termination"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
+	"github.com/Azure/karpenter-provider-azure/pkg/operator"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
@@ -254,6 +259,42 @@ var _ = Describe("Coexistence mode", func() {
 		Expect(instanceTypes).To(BeEmpty())
 		Expect(cloudProvider.IsDrifted(ctx, registeredClaim(foreignRef("managed-default"), ""))).To(BeEmpty())
 		Expect(recorder.Events).To(BeEmpty())
+	})
+
+	It("applies NodeOverlays to its own NodePools without writing their status, which the other installation owns", func() {
+		Expect(options.ValidateCoexistenceFeatureGates(false)).To(Succeed())
+		Expect(options.ValidateCoexistenceFeatureGates(true)).To(MatchError(ContainSubstring("CapacityBuffer")))
+
+		test.ApplyDefaultStatus(nodeClass, env, testOptions.UseSIG)
+		nodePool := nodePoolFor(ownRef(nodeClass))
+		overlay := coretest.NodeOverlay(karpv1alpha1.NodeOverlay{Spec: karpv1alpha1.NodeOverlaySpec{
+			Requirements: []karpv1alpha1.NodeSelectorRequirement{{Key: corev1.LabelInstanceTypeStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"Standard_D2_v3"}}},
+			Price:        lo.ToPtr("0.001"),
+		}})
+		ExpectApplied(ctx, env.Client, nodeClass, nodePool, overlay)
+
+		kubeClient := operator.CoreControllerClient(env.Client)
+		controller := nodeoverlay.NewController(fakeClock, kubeClient, cloudProvider, azureEnv.InstanceTypeStore, state.NewCluster(fakeClock, env.Client, cloudProvider))
+		_, err := controller.Reconcile(ctx, reconcile.Request{})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(ExpectExists(ctx, env.Client, overlay).Status.Conditions).To(BeEmpty(), "the other installation owns the status")
+		instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+		Expect(err).ToNot(HaveOccurred())
+		overlaid, err := azureEnv.InstanceTypeStore.ApplyAll(nodePool.Name, instanceTypes)
+		Expect(err).ToNot(HaveOccurred())
+		d2v3, found := lo.Find(overlaid, func(it *corecloudprovider.InstanceType) bool { return it.Name == "Standard_D2_v3" })
+		Expect(found).To(BeTrue())
+		Expect(d2v3.Offerings).ToNot(BeEmpty())
+		for _, offering := range d2v3.Offerings {
+			Expect(offering.Price).To(Equal(0.001))
+		}
+
+		// Every other status write passes through.
+		stored := nodePool.DeepCopy()
+		nodePool.StatusConditions().SetTrue(karpv1.ConditionTypeValidationSucceeded)
+		Expect(kubeClient.Status().Patch(ctx, nodePool, client.MergeFrom(stored))).To(Succeed())
+		Expect(ExpectExists(ctx, env.Client, nodePool).StatusConditions().Get(karpv1.ConditionTypeValidationSucceeded).IsTrue()).To(BeTrue())
+		ExpectDeleted(ctx, env.Client, overlay)
 	})
 
 	It("garbage collects only its own orphaned VMs", func() {
