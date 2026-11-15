@@ -314,6 +314,22 @@ the NodePool's disruption budgets, so removing a region replaces its nodes like
 any other drift. Instance garbage collection lists the whole node resource
 group, so it also deletes the VM of a removed region whose NodeClaim is gone.
 
+A region can be removed and listed again without a restart. While it is not
+listed, the controller makes no network, SKU, quota or image call for it and
+keeps its regional state in memory; only the region's public price list is
+still refreshed every 12 hours. A launch that recorded the region before its
+removal fails before any Azure write, and core deletes that NodeClaim after its
+launch timeout. Delete the region's network only when its subnet has no IP
+configurations left: Azure refuses to delete a subnet that NICs still use, and
+removing the peering earlier cuts the pod network of the region's remaining
+nodes. When the region is listed again, the next status check tests its subnet
+again. Failed checks are never cached, so the region reports
+`RegionsUnavailable` until its network, with an NSG on the subnet, exists again,
+and then serves on it, whether the subnet ID is the same or new.
+`MULTI_REGION_NODE_IDENTITIES` is read at start: keep a removed region's
+identities while it may return, or restart the controller after changing its
+entry.
+
 A failing region does not block the others. Every three minutes the subnet
 status check tests each listed region: its subnet, its SKU catalog and, once
 the NodeClass status lists node images, an image for it. A failing region gets

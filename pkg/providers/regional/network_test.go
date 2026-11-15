@@ -95,3 +95,21 @@ func TestRegionalNetworkValidationIsReusedBriefly(t *testing.T) {
 	}
 	g.Expect(subnets.calls).To(Equal(3), "expired successes are re-checked and failures are never cached")
 }
+
+func TestRegionalNetworkValidationAcceptsARecreatedNetwork(t *testing.T) {
+	g := NewWithT(t)
+	clk := clocktesting.NewFakeClock(time.Now())
+	networks := &testNetworks{location: "eastus2"}
+	subnets := &testSubnets{properties: &armnetwork.SubnetPropertiesFormat{NetworkSecurityGroup: &armnetwork.SecurityGroup{ID: lo.ToPtr("/synthetic/nsg")}}}
+	v := &NetworkValidator{SubscriptionID: "00000000-0000-0000-0000-000000000001", VirtualNetworks: networks, Subnets: subnets, Clock: clk}
+	region := testClass().Spec.Regions[0]
+	g.Expect(v.Validate(t.Context(), region)).To(Succeed())
+	// The region's network is deleted, and the cached success expires.
+	clk.Step(validationTTL)
+	networks.err = errors.New("synthetic ResourceGroupNotFound")
+	g.Expect(v.Validate(t.Context(), region)).To(MatchError(ContainSubstring("getting regional VNet")))
+	// The network is created again with the same IDs. The next check passes, with no restart.
+	networks.err = nil
+	g.Expect(v.Validate(t.Context(), region)).To(Succeed())
+	g.Expect(subnets.calls).To(Equal(2), "the failed check was not cached")
+}
