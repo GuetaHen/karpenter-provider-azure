@@ -68,7 +68,7 @@ authoritative — they mark the exact places where a one-sided change silently b
 - [`pkg/operator/`](./pkg/operator/) — operator wiring and options/flags.
 - [`pkg/fake/`](./pkg/fake/) and [`pkg/test/`](./pkg/test/) — fakes and the test environment used by
   acceptance tests.
-- [`charts/`](./charts/) — `karpenter` and `karpenter-crd` Helm charts. CRD definitions are copied
+- [`charts/`](./charts/) — `karpenter` and `karpenter-crd` Helm charts. CRD templates are copied
   from `pkg/apis/crds` by `make verify`.
 - [`test/`](./test/) — real end-to-end suites run against a live AKS cluster. See
   [test/README.md](./test/README.md).
@@ -88,7 +88,7 @@ The supported entry points are the Make targets; see [CONTRIBUTING.md](./CONTRIB
 
 Do not run `go generate` directly and do not hand-edit generated output. `make verify` performs
 code generation, copies upstream and provider CRDs into `pkg/apis/crds` and
-`charts/karpenter-crd/definitions`, and fails if the working tree is dirty afterwards.
+`charts/karpenter-crd/templates`, and fails if the working tree is dirty afterwards.
 
 CI runs `make ci-non-test` and `make ci-test` across Kubernetes versions 1.31 through 1.37. E2E
 suites run through [`.github/workflows/e2e-matrix.yaml`](./.github/workflows/e2e-matrix.yaml); a new
@@ -221,7 +221,7 @@ Analyze PRs for these compatibility scenarios.
 - **What to check**: Generated artifacts and upgrade impact on objects that already exist.
 - **Breaking signals**:
   - New fields or behavior added to `v1alpha2` rather than `v1beta1`.
-  - Hand-edited `zz_generated.deepcopy.go`, CRD YAML, or `charts/karpenter-crd/definitions` content.
+  - Hand-edited `zz_generated.deepcopy.go`, CRD YAML, or `charts/karpenter-crd/templates` content.
   - Removing or narrowing a field, tightening CEL validation, or changing a default — existing
     stored objects must remain valid.
   - Hash-relevant spec changes without the corresponding hash version bump and test update,

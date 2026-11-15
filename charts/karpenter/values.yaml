@@ -166,7 +166,7 @@ coexistence:
   # -- Run beside another Karpenter installation that serves karpenter.azure.com AKSNodeClasses, such as AKS node
   # auto-provisioning. The controller then serves AKSNodeClasses of the multiregion.io API group and only the NodePools
   # and NodeClaims that reference them. Requires webhook.enabled=false. Install the multiregion.io CRD with the
-  # karpenter-crd chart and coexistence.enabled=true, and install this chart with --skip-crds.
+  # karpenter-coexistence-crd chart, and install this chart with --skip-crds.
   enabled: false
 webhook:
   # -- Whether to enable the webhooks and webhook permissions.

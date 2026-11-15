@@ -106,8 +106,9 @@ verify: tidy download ## Verify code. Includes dependencies, linting, formatting
 	hack/validation/taints.sh
 	hack/mutation/kubectl_get_ux.sh
 	# Package the adjusted CRDs and the coexistence CRD, then validate chart delivery
-	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS) coexistence/multiregion.io_aksnodeclasses.yaml) charts/karpenter-crd/definitions
-	chmod u+w $(addprefix charts/karpenter-crd/definitions/,$(SUPPORTED_CRDS) multiregion.io_aksnodeclasses.yaml)
+	cp -f $(addprefix pkg/apis/crds/,$(SUPPORTED_CRDS)) charts/karpenter-crd/templates
+	chmod u+w $(addprefix charts/karpenter-crd/templates/,$(SUPPORTED_CRDS))
+	cp -f pkg/apis/crds/coexistence/multiregion.io_aksnodeclasses.yaml charts/karpenter-coexistence-crd/templates
 	hack/validation/capacitybuffer.sh
 	hack/validation/coexistence-chart.sh
 	hack/github/dependabot.sh

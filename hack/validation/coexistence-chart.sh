@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Validates that both charts install coexistence mode by values alone:
-# - the CRD chart renders only the multiregion.io AKSNodeClass CRD in coexistence
-#   mode, and every other CRD otherwise;
+# Validates that the charts install coexistence mode by values and --skip-crds:
+# - the karpenter-coexistence-crd chart renders only the multiregion.io AKSNodeClass
+#   CRD, which Helm keeps when its release is uninstalled, and the karpenter-crd
+#   chart renders every other CRD;
 # - the controller chart refuses coexistence mode with the webhooks enabled, sets
 #   COEXISTENCE_MODE, and grants access to multiregion.io AKSNodeClasses plus get on
 #   karpenter.azure.com AKSNodeClasses instead of access to the latter; and
@@ -33,14 +34,19 @@ maintenance_window_access() {
         | any($objects[]; .kind == "RoleBinding" and (.roleRef.name as $name | any($roles[]; . == $name)))' >/dev/null
 }
 
-helm template karpenter-crd charts/karpenter-crd >"$tmp_dir/crds.yaml"
-helm template karpenter-crd charts/karpenter-crd --set coexistence.enabled=true >"$tmp_dir/coexistence-crds.yaml"
-[[ "$(crd_names "$tmp_dir/crds.yaml")" == "aksnodeclasses.karpenter.azure.com,capacitybuffers.autoscaling.x-k8s.io,nodeclaims.karpenter.sh,nodeoverlays.karpenter.sh,nodepools.karpenter.sh" ]] || {
-    echo "expected the CRD chart to render every CRD except the multiregion.io one by default"
+helm lint charts/karpenter-coexistence-crd >"$tmp_dir/lint.txt" || {
+    cat "$tmp_dir/lint.txt"
     exit 1
 }
-[[ "$(crd_names "$tmp_dir/coexistence-crds.yaml")" == "aksnodeclasses.multiregion.io" ]] || {
-    echo "expected the CRD chart to render only the multiregion.io AKSNodeClass CRD in coexistence mode"
+helm template karpenter-crd charts/karpenter-crd >"$tmp_dir/crds.yaml"
+helm template karpenter-coexistence-crd charts/karpenter-coexistence-crd >"$tmp_dir/coexistence-crds.yaml"
+[[ "$(crd_names "$tmp_dir/crds.yaml")" == "aksnodeclasses.karpenter.azure.com,capacitybuffers.autoscaling.x-k8s.io,nodeclaims.karpenter.sh,nodeoverlays.karpenter.sh,nodepools.karpenter.sh" ]] || {
+    echo "expected the karpenter-crd chart to render every CRD except the multiregion.io one"
+    exit 1
+}
+[[ "$(crd_names "$tmp_dir/coexistence-crds.yaml")" == "aksnodeclasses.multiregion.io" &&
+    "$(yq eval-all 'select(.kind == "CustomResourceDefinition") | .metadata.annotations["helm.sh/resource-policy"]' "$tmp_dir/coexistence-crds.yaml")" == "keep" ]] || {
+    echo "expected the karpenter-coexistence-crd chart to render only the multiregion.io AKSNodeClass CRD, which Helm keeps on uninstall"
     exit 1
 }
 

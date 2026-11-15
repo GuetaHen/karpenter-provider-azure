@@ -50,6 +50,7 @@ func TestCoexistenceCRDServesTheDefaultV1beta1Schema(t *testing.T) {
 	g.Expect(yaml.Unmarshal(apis.CoexistenceAKSNodeClassCRD, &crd)).To(Succeed())
 	g.Expect(crd.Name).To(Equal(coexistence.CRDName))
 	g.Expect(crd.Spec.Group).To(Equal(coexistence.Group))
+	g.Expect(crd.Annotations).To(HaveKeyWithValue("helm.sh/resource-policy", "keep"), "uninstalling the CRD chart must not delete every coexistence AKSNodeClass")
 	g.Expect(crd.Spec.Scope).To(Equal(defaultCRD.Spec.Scope))
 	g.Expect(crd.Spec.Names.Kind).To(Equal(v1beta1.AKSNodeClassKind))
 	g.Expect(crd.Spec.Names.ListKind).To(Equal(defaultCRD.Spec.Names.ListKind))

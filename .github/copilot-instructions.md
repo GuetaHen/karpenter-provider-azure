@@ -32,7 +32,7 @@ rather than pattern matching.
   planned for removal, so new fields and behavior belong in `v1beta1`; do not ask for `v1alpha2`
   changes purely for parity. Spec changes usually affect defaulting, CEL validation, the nodeclass
   hash, drift, and the generated CRDs.
-- **Generated files** — `zz_generated.deepcopy.go`, CRD YAML, and `charts/karpenter-crd/definitions`
+- **Generated files** — `zz_generated.deepcopy.go`, CRD YAML, and `charts/karpenter-crd/templates`
   are produced by `make verify`. Flag hand-edited generated output.
 - **Azure API semantics** — retries, throttling, pagination, long-running operation polling,
   cancellation, nil SDK pointers, concurrency control, and eventual consistency. Never assume a

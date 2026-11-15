@@ -394,8 +394,8 @@ In coexistence mode the controller:
 - never installs or changes a CRD, and waits through API discovery until
   `multiregion.io` is served. Install
   `pkg/apis/crds/coexistence/multiregion.io_aksnodeclasses.yaml` from the same
-  revision, for example with the `karpenter-crd` chart as shown below. It serves
-  the `v1beta1` schema of
+  revision, for example with the `karpenter-coexistence-crd` chart as shown
+  below. It serves the `v1beta1` schema of
   `karpenter.azure.com_aksnodeclasses.yaml` under the new group, and a unit test
   fails when the two differ. Both installations share the `karpenter.sh`
   NodePool and NodeClaim CRDs, whose installed schemas must be compatible with
@@ -439,16 +439,24 @@ Beyond the default rules, coexistence mode needs these Kubernetes permissions:
 `patch` and `update` on its `status`, and `get` on
 `aksnodeclasses.karpenter.azure.com`. It needs no permission on CRDs and no write
 on `karpenter.azure.com` AKSNodeClasses. The Helm charts install coexistence
-mode by values alone:
+mode by values and `--skip-crds`:
 
-1. Install or upgrade the `karpenter-crd` chart with `coexistence.enabled=true`.
-   It then renders only the `multiregion.io` CRD, which Helm applies on install
-   and on every upgrade.
-2. Install or upgrade the `karpenter` chart with `coexistence.enabled=true`,
-   `webhook.enabled=false` and `--skip-crds`. It sets `COEXISTENCE_MODE=true`
-   and grants the rules above instead of those of the default group. It refuses
-   to render with the webhooks enabled, whose rules update CRDs that both
-   installations share.
+1. Install or upgrade the `karpenter-coexistence-crd` chart. It holds only the
+   `multiregion.io` CRD, which Helm applies on install and on every upgrade.
+   The CRD carries `helm.sh/resource-policy: keep`: uninstalling the release,
+   or upgrading to a chart without the CRD, leaves the CRD and every
+   `multiregion.io` AKSNodeClass in place; delete the CRD yourself to remove
+   them. Do not install the `karpenter-crd` chart for this controller: its five
+   CRDs belong to the other installation.
+2. Install or upgrade the `karpenter` chart with `--skip-crds`,
+   `coexistence.enabled=true` and `webhook.enabled=false`. It sets
+   `COEXISTENCE_MODE=true` and grants the rules above instead of those of the
+   default group. It refuses to render with the webhooks enabled, whose rules
+   update CRDs that both installations share. Without `--skip-crds`,
+   `helm install` creates whichever of the five CRDs in `charts/karpenter/crds`
+   the cluster lacks: NodePool, NodeClaim, NodeOverlay, the
+   `karpenter.azure.com` AKSNodeClass and CapacityBuffer. Helm never upgrades or
+   deletes the CRDs of that directory.
 
 Give the release a name and a namespace of its own, so that its cluster-scoped
 RBAC objects and its leader election lease differ from those of the other
