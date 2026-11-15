@@ -281,17 +281,21 @@ that admits only cluster or node sources does not admit it. The agent accepts
 UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs into the
 tunnel. It does not start when the pod CIDR overlaps `169.254.0.0/16`, or when
 the transit prefix is not inside `169.254.0.0/16`, has host bits, is too small
-for the pod CIDR or contains `169.254.169.254`. On every pass it changes nothing
-on the node while another VXLAN device uses UDP 4789, a device with one of its
-names is not its own, or a host address that it did not assign lies in the
-transit prefix; what it programmed before stays. If it cannot finish creating
-one of its devices, it deletes the device again. When it is stopped, it
-finishes a running pass first; only if it is killed or crashes between
-creating a device and marking it as its own does the device stay unmarked,
-and the agent then refuses the node until the device is deleted or the node
-restarts. A home node's peers are the regional nodes, and its CNI
-configuration stays as AKS wrote it. A regional node's peers are all other
-nodes, and there the agent also:
+for the pod CIDR or contains `169.254.169.254`. It programs the tunnel when it
+starts, once a minute, when what it must program changes and after a failed
+attempt, and each time it first checks the node: it changes nothing while
+another VXLAN device uses UDP 4789, a device with one of its names is not its
+own, or a host address that it did not assign lies in the transit prefix; what
+it programmed before stays. If it cannot finish creating one of its devices,
+it deletes the device again. When it is stopped, the running pass ends early:
+its requests to the API server, to instance metadata and to the Cilium agent
+are cancelled and it leaves the taint alone, but programming of the tunnel or
+of the CNI file that is in progress completes first. A device stays unmarked
+when its deletion fails as well, or when the agent is killed or crashes
+between creating the device and marking it as its own; the agent then refuses
+the node until the device is deleted or the node restarts. A home node's peers
+are the regional nodes, and its CNI configuration stays as AKS wrote it. A
+regional node's peers are all other nodes, and there the agent also:
 
 - writes a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the
@@ -302,7 +306,9 @@ nodes, and there the agent also:
   instance metadata.
 
 A regional node offers 253 pod addresses, so a NodeClass that sets `maxPods`
-above 253 is not supported on regional nodes.
+above 253 is not supported on regional nodes. The plugins `cilium-cni`,
+`host-local` and `tuning` must be executable files in `/opt/cni/bin`; while one
+is missing, the agent keeps a regional node not ready.
 
 The agent writes that CNI file once the node's Cilium agent is healthy, and
 only while `/etc/cni/net.d` holds no other CNI configuration: pods started with

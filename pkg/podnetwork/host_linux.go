@@ -218,8 +218,8 @@ func (h *Host) ensureVXLAN(plan Plan, bridge netlink.Link) (netlink.Link, error)
 }
 
 // create adds a device, marks it as the agent's and sets it up. When a step after the addition fails,
-// it deletes the device again, as far as it can, because every later pass would refuse an unmarked
-// device with a tunnel name, and returns the error of the step.
+// it deletes the device again, because every later pass would refuse an unmarked device with a
+// tunnel name. It returns the error of the step, with the error of the deletion if that fails too.
 func (h *Host) create(link netlink.Link) (netlink.Link, error) {
 	name := link.Attrs().Name
 	if err := h.kernel.LinkAdd(link); err != nil {
@@ -227,7 +227,9 @@ func (h *Host) create(link netlink.Link) (netlink.Link, error) {
 	}
 	created, err := h.markAndSetUp(name)
 	if err != nil {
-		_ = h.kernel.LinkDel(link)
+		if delErr := h.kernel.LinkDel(link); delErr != nil {
+			return nil, fmt.Errorf("%w; deleting device %s again: %w", err, name, delErr)
+		}
 		return nil, err
 	}
 	return created, nil

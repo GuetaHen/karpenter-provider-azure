@@ -266,6 +266,17 @@ func runAgent(a *Agent) func() {
 	}
 }
 
+// countPasses returns interceptors that count the passes of the agent in passes. Every pass lists
+// the Nodes once.
+func countPasses(passes *atomic.Int32) interceptor.Funcs {
+	return interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+		if _, ok := list.(*corev1.NodeList); ok {
+			passes.Add(1)
+		}
+		return c.List(ctx, list, opts...)
+	}}
+}
+
 // testLog returns a logger that records its lines as JSON, and a function that returns the lines.
 func testLog() (logr.Logger, func() []string) {
 	var mu sync.Mutex
@@ -455,7 +466,7 @@ func TestAgentRetriesTheTaintAfterAConflict(t *testing.T) {
 		removed bool
 	}{
 		"an unrelated change":             {changes: 1, change: relabel("example.com/changed", "true"), patches: 2, removed: true},
-		"a change before every patch":     {changes: 10, change: bump, patches: taintAttempts},
+		"a change before every patch":     {changes: 10, change: bump, patches: 3},
 		"a change that fails the checks":  {changes: 1, change: relabel(HostRoutingLabel, "true"), patches: 1},
 		"a change of the accepted values": {changes: 1, change: relabel(corev1.LabelTopologyRegion, "westus2"), patches: 1},
 		"another Node of the same name":   {changes: 1, change: replaceNode, patches: 1},
@@ -617,13 +628,19 @@ func TestAgentLogsWhatChanges(t *testing.T) {
 }
 
 func TestAgentLeavesTheTaintAloneWhenAPassEndsEarly(t *testing.T) {
-	g := NewWithT(t)
-	a, kube, _ := newAgentTest(t, twoNodes(), "home-1", interceptor.Funcs{}, startupTaint)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	a.Pass(ctx, true)
-	g.Expect(a.Ready()).To(MatchError(context.Canceled))
-	g.Expect(taintKeys(t, kube, "home-1")).To(Equal([]string{DefaultStartupTaintKey}))
+	stopped, stop := context.WithCancel(context.Background())
+	stop()
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	for name, ctx := range map[string]context.Context{"by a stop": stopped, "by its timeout": expired} {
+		t.Run(name, func(t *testing.T) {
+			g := NewWithT(t)
+			a, kube, _ := newAgentTest(t, twoNodes(), "home-1", interceptor.Funcs{}, startupTaint)
+			a.Pass(ctx, true)
+			g.Expect(a.Ready()).To(MatchError(ctx.Err()))
+			g.Expect(taintKeys(t, kube, "home-1")).To(Equal([]string{DefaultStartupTaintKey}))
+		})
+	}
 }
 
 func TestAgentProbes(t *testing.T) {
@@ -688,13 +705,7 @@ func TestAgentRun(t *testing.T) {
 	saved := []time.Duration{fullPassInterval, retryInterval, settleTime}
 	t.Cleanup(func() { fullPassInterval, retryInterval, settleTime = saved[0], saved[1], saved[2] })
 	var lists atomic.Int32
-	funcs := interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-		if _, ok := list.(*corev1.NodeList); ok {
-			lists.Add(1)
-		}
-		return c.List(ctx, list, opts...)
-	}}
-	a, _, f := newAgentTest(t, twoNodes(), "home-1", funcs)
+	a, _, f := newAgentTest(t, twoNodes(), "home-1", countPasses(&lists))
 
 	// After its first pass, the agent runs a pass when something changes, and only then while the
 	// node is ready.
@@ -723,14 +734,18 @@ func TestAgentRun(t *testing.T) {
 	stop()
 }
 
+// TestAgentPutsTheTaintBackOnlyOnTheNodeItChecked changes the Node of a regional node that is not
+// ready before the first patch of the taint. The agent retries while the Node has the UID that the
+// pass checked, even when the Node now fails the checks: the node is not ready either way.
 func TestAgentPutsTheTaintBackOnlyOnTheNodeItChecked(t *testing.T) {
 	for name, tc := range map[string]struct {
 		change  func(context.Context, client.WithWatch, *corev1.Node) error
 		patches int
 		tainted bool
 	}{
-		"an unrelated change":           {change: relabel("example.com/changed", "true"), patches: 2, tainted: true},
-		"another Node of the same name": {change: replaceNode, patches: 1},
+		"an unrelated change":            {change: relabel("example.com/changed", "true"), patches: 2, tainted: true},
+		"another Node of the same name":  {change: replaceNode, patches: 1},
+		"a change that fails the checks": {change: relabel(HostRoutingLabel, "true"), patches: 2, tainted: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			g := NewWithT(t)
@@ -778,7 +793,8 @@ func TestAgentWithdrawsANodeWhoseValuesChange(t *testing.T) {
 
 func TestAgentFinishesAPassWhenItStops(t *testing.T) {
 	g := NewWithT(t)
-	a, _, f := newAgentTest(t, twoNodes(), "home-1", interceptor.Funcs{})
+	var passes atomic.Int32
+	a, _, f := newAgentTest(t, twoNodes(), "home-1", countPasses(&passes))
 	applying, release := make(chan struct{}), make(chan struct{})
 	f.applying = func() {
 		close(applying)
@@ -795,6 +811,7 @@ func TestAgentFinishesAPassWhenItStops(t *testing.T) {
 	g.Consistently(done, 100*time.Millisecond).ShouldNot(BeClosed())
 	close(release)
 	g.Eventually(done).Should(BeClosed())
-	g.Expect(f.count("tunnel")).To(Equal(1))
+	// The pass that was programming the tunnel finishes, and no other pass starts.
+	g.Expect(passes.Load()).To(BeEquivalentTo(1))
 	g.Expect(a.Ready()).To(MatchError(context.Canceled))
 }

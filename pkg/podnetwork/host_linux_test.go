@@ -74,6 +74,9 @@ func (k *fakeKernel) LinkAdd(link netlink.Link) error {
 
 // LinkDel deletes a device with its addresses, routes and entries, as the kernel does.
 func (k *fakeKernel) LinkDel(link netlink.Link) error {
+	if k.fail["LinkDel"] == link.Attrs().Name {
+		return errors.New("deleting failed")
+	}
 	index := link.Attrs().Index
 	k.links = slices.DeleteFunc(k.links, func(l netlink.Link) bool { return l.Attrs().Index == index })
 	k.addrs = slices.DeleteFunc(k.addrs, func(a netlink.Addr) bool { return a.LinkIndex == index })
@@ -421,4 +424,20 @@ func TestHostDeletesADeviceWhoseSetupFails(t *testing.T) {
 			expectProgrammed(g, k, plan)
 		})
 	}
+
+	// When the deletion fails as well, both errors are returned and the unmarked device stays, so the
+	// next pass refuses the node.
+	t.Run("LinkDel", func(t *testing.T) {
+		g := NewWithT(t)
+		host, k, _ := testHost()
+		k.fail = map[string]string{"LinkSetAlias": VXLANName, "LinkDel": VXLANName}
+		plan := testConfig(t).TunnelPlan(regionalOwn, []Node{homePeer})
+		err := host.Apply(plan)
+		g.Expect(err).To(MatchError(ContainSubstring("marking device " + VXLANName + ": marking failed")))
+		g.Expect(err).To(MatchError(ContainSubstring("deleting device " + VXLANName + " again: deleting failed")))
+		g.Expect(k.links).To(ContainElement(WithTransform(func(l netlink.Link) string { return l.Attrs().Name }, Equal(VXLANName))))
+
+		k.fail = nil
+		g.Expect(host.Apply(plan)).To(MatchError(ContainSubstring("its creation was interrupted")))
+	})
 }

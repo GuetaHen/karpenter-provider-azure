@@ -73,6 +73,10 @@ func TestSettingsFromEnv(t *testing.T) {
 		"a TRANSIT_PREFIX outside link-local space": {"TRANSIT_PREFIX", "10.0.0.0/18"},
 		"a STARTUP_TAINT_KEY that is no taint key":  {"STARTUP_TAINT_KEY", "not a key"},
 		"a PROBE_ADDRESS without a port":            {"PROBE_ADDRESS", "127.0.0.1"},
+		"a PROBE_ADDRESS whose port is no number":   {"PROBE_ADDRESS", "127.0.0.1:abc"},
+		"a PROBE_ADDRESS whose port is too large":   {"PROBE_ADDRESS", "127.0.0.1:99999"},
+		"a PROBE_ADDRESS with port 0":               {"PROBE_ADDRESS", "127.0.0.1:0"},
+		"a PROBE_ADDRESS that is only a colon":      {"PROBE_ADDRESS", ":"},
 	} {
 		env := maps.Clone(required)
 		env[change[0]] = change[1]

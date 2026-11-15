@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -117,7 +118,17 @@ func TestCNIConfigBytes(t *testing.T) {
 `))
 }
 
+// skipEnsureOnWindows skips a test of Ensure on Windows, where Go reports no file as executable
+// and Ensure therefore refuses every node at its check of the plugins. The agent runs on Linux.
+func skipEnsureOnWindows(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("Go reports no file as executable on Windows, so Ensure stops at its check of the plugins")
+	}
+}
+
 func TestCNIEnsure(t *testing.T) {
+	skipEnsureOnWindows(t)
 	g := NewWithT(t)
 	c := testCNI(t)
 	written := "---------- " + string(CNIConfig(testPodRange))
@@ -146,6 +157,7 @@ func TestCNIEnsure(t *testing.T) {
 }
 
 func TestCNIEnsureRefusesAndChangesNothing(t *testing.T) {
+	skipEnsureOnWindows(t)
 	for name, prepare := range map[string]func(t *testing.T, c CNI){
 		"a later .conflist before the first write": func(t *testing.T, c CNI) {
 			writeTestFile(t, filepath.Join(c.ConfDir, "05-cilium.conflist"), "{}", 0o600)
@@ -190,4 +202,20 @@ func TestCNIEnsureRefusesAndChangesNothing(t *testing.T) {
 			g.Expect(cniConfigState(c.ConfDir)).To(Equal(before))
 		})
 	}
+}
+
+// TestWriteCNIConfigKeepsAFileThatAppearedMeanwhile puts a file under the name of the agent's CNI
+// configuration after Ensure looked, as another writer could. The write fails and leaves that file
+// as it is.
+func TestWriteCNIConfigKeepsAFileThatAppearedMeanwhile(t *testing.T) {
+	g := NewWithT(t)
+	dir := t.TempDir()
+	writeTestFile(t, filepath.Join(dir, CNIConfigName), "{}", 0o600)
+	root, err := os.OpenRoot(dir)
+	requireNoError(t, err)
+	defer root.Close()
+
+	g.Expect(writeCNIConfig(root, CNIConfig(testPodRange))).To(MatchError(ContainSubstring("writing the CNI configuration")))
+	g.Expect(cniConfigState(dir)).To(Equal("---------- {}"))
+	g.Expect(dirNames(t, dir)).To(ConsistOf(CNIConfigName))
 }

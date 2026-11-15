@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -78,11 +79,25 @@ func SettingsFromEnv(lookup func(string) (string, bool)) (Settings, error) {
 	if errs := validation.IsQualifiedName(s.StartupTaintKey); len(errs) > 0 {
 		return s, fmt.Errorf("STARTUP_TAINT_KEY must hold a taint key: %s", strings.Join(errs, "; "))
 	}
-	if _, _, err := net.SplitHostPort(s.ProbeAddress); err != nil {
-		return s, fmt.Errorf("PROBE_ADDRESS must hold a host and port: %w", err)
+	if err := checkProbeAddress(s.ProbeAddress); err != nil {
+		return s, err
 	}
 	if err := s.Config.Validate(); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// checkProbeAddress requires a host and port whose port is a number from 1 to 65535, so that a
+// wrong PROBE_ADDRESS stops the agent at its start and not only when it serves its probes.
+func checkProbeAddress(address string) error {
+	_, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return fmt.Errorf("PROBE_ADDRESS must hold a host and port: %w", err)
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return fmt.Errorf("PROBE_ADDRESS must hold a port from 1 to 65535, not %q", port)
+	}
+	return nil
 }

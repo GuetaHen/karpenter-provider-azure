@@ -124,6 +124,34 @@ func TestKubeClusterSetTaints(t *testing.T) {
 	g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "%v", err)
 }
 
+// TestKubeClusterReadsTheCacheOnlyToList gives the cache and the client different versions of a
+// Node, as when the cache lags behind the API server. List reads the cache, and GetNode, which the
+// agent uses after a conflict, and CiliumConfig read the API server.
+func TestKubeClusterReadsTheCacheOnlyToList(t *testing.T) {
+	g := NewWithT(t)
+	ctx := context.Background()
+	node := func(source string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{"example.com/source": source}}}
+	}
+	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
+		Data: map[string]string{"cni-exclusive": "false"}}
+	k := &KubeCluster{
+		Cache:  fakeKubeCluster(t, interceptor.Funcs{}, node("cache")).Cache,
+		Client: fakeKubeCluster(t, interceptor.Funcs{}, node("server"), config).Client,
+	}
+
+	objects, err := k.List(ctx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(objects.Nodes).To(HaveLen(1))
+	g.Expect(objects.Nodes[0].Labels).To(HaveKeyWithValue("example.com/source", "cache"))
+	fresh, err := k.GetNode(ctx, "node-1")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(fresh.Labels).To(HaveKeyWithValue("example.com/source", "server"))
+	data, err := k.CiliumConfig(ctx)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(data).To(Equal(map[string]string{"cni-exclusive": "false"}))
+}
+
 func TestCacheOptions(t *testing.T) {
 	g := NewWithT(t)
 	scheme, err := NewScheme()
