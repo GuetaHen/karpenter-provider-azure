@@ -73,10 +73,11 @@ type InstanceTypes struct {
 
 // List merges the instance types of every listed region into one catalog. A region that
 // failed the NodeClass's last check offers no capacity: its instance types stay with
-// unavailable offerings, so that core drift keeps its NodeClaims, or, if it has never
-// loaded, ValidateSubnets found no NodeClaims in it and it is left out. Any other region
-// that has never loaded fails the NodeClass: a partial catalog would make core drift treat
-// healthy NodeClaims in that region as having an unknown instance type.
+// unavailable offerings, so that core drift still finds the instance types of its
+// NodeClaims, or, if it has never loaded, ValidateSubnets found no NodeClaims in it and it
+// is left out. Any other region that has never loaded fails the NodeClass: a partial catalog
+// would make core drift treat healthy NodeClaims in that region as having an unknown
+// instance type.
 func (p *InstanceTypes) List(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) ([]*cloudprovider.InstanceType, error) {
 	if len(nodeClass.Spec.Regions) == 0 {
 		return p.Provider.List(ctx, nodeClass)

@@ -331,15 +331,16 @@ identities while it may return, or restart the controller after changing its
 entry.
 
 A failing region does not block the others. Every three minutes the subnet
-status check tests each listed region: its subnet, its SKU catalog and, once
+status check tests each listed region: its SKU catalog, its subnet and, once
 the NodeClass status lists node images, an image for it. A failing region gets
 no new nodes. Its instance types stay in the catalog with unavailable
-offerings, so core drift keeps its NodeClaims; a region that has never loaded
-and has no NodeClaims is left out. `SubnetsReady` stays `True` with reason
-`RegionsUnavailable` and names the failing regions, and a region serves again
-once it passes. The NodeClass is not ready only while every listed region
-fails, or while a region that has never loaded its SKU catalog has NodeClaims
-(reason `RegionalCatalogUnavailable`). Image resolution leaves out a failing
+offerings, so core drift still finds the instance types of its NodeClaims; a
+region that has never loaded and has no NodeClaims is left out. `SubnetsReady`
+stays `True` with reason `RegionsUnavailable` and names the failing regions,
+and a region serves again once it passes. The NodeClass is not ready only while
+every listed region fails, or while a region that has never loaded its SKU
+catalog has NodeClaims (reason `RegionalCatalogUnavailable`), even when its
+subnet fails as well. Image resolution leaves out a failing
 region that the status has no image for, so that the images of the other
 regions keep refreshing; a region whose images are in use keeps them through a
 failure.

@@ -891,6 +891,27 @@ var _ = Describe("CloudProvider", func() {
 				_, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
 				Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal + " has no SKU catalog yet")))
 			})
+			It("should fail the NodeClass while a never-loaded region with a NodeClaim also fails its subnet check", func() {
+				registry.WithKubeClient(env.Client)
+				remote.SKUsAPI.Error = errors.New("synthetic SKU outage")
+				regionErrs[fake.RegionNonZonal] = errors.New("synthetic subnet outage")
+				placed := coretest.NodeClaim(karpv1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+						regional.PlacementAnnotation: string(lo.Must(json.Marshal(nodeClass.Spec.Regions[1]))),
+					}},
+					Spec: karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{
+						Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name,
+					}},
+				})
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, placed)
+				notLoaded := ContainSubstring("region " + fake.RegionNonZonal + " has no SKU catalog yet")
+				err := registry.ValidateSubnets(ctx, nodeClass)
+				Expect(err).To(MatchError(notLoaded), "the SKU catalog is checked before the subnet")
+				var partial interface{ UnavailableRegions() []string }
+				Expect(errors.As(err, &partial)).To(BeFalse(), "SubnetsReady turns False, so the NodeClass is not ready")
+				_, err = cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).To(MatchError(notLoaded), "no partial catalog in which core drift would miss the NodeClaim's instance type")
+			})
 			It("should keep provisioning in the other regions while a region without NodeClaims fails its checks", func() {
 				registry.WithKubeClient(env.Client)
 				regionErrs[fake.RegionNonZonal] = errors.New("synthetic subnet outage")

@@ -234,12 +234,13 @@ func (p *entry) refreshQuota(ctx context.Context, region string, now time.Time) 
 	p.quotaUpdated = now
 }
 
-// ValidateSubnets checks each listed region: its subnet, its SKU catalog and, once the status
+// ValidateSubnets checks each listed region: its SKU catalog, its subnet and, once the status
 // lists node images, an image for it. A failing region does not block the others: it gets no
-// new nodes while its instance types stay in the catalog for core drift, and the returned error
-// has reason RegionsUnavailable. The NodeClass stays not ready only while every region fails, or
-// while a region that has never loaded its SKU catalog has NodeClaims, whose instance types core
-// drift would otherwise not find. The subnet reconciler repeats the check.
+// new nodes while its instance types stay in the catalog, so that core drift still finds those
+// of its NodeClaims, and the returned error has reason RegionsUnavailable. The NodeClass stays
+// not ready only while every region fails, or while a region that has never loaded its SKU
+// catalog has NodeClaims, whose instance types core drift would otherwise not find. The subnet
+// reconciler repeats the check.
 func (r *Registry) ValidateSubnets(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
 	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
 		return err
@@ -277,13 +278,15 @@ func (r *Registry) ValidateSubnets(ctx context.Context, nodeClass *v1beta1.AKSNo
 	return &regionsUnavailableError{regions: sets.List(unavailable), errs: errs}
 }
 
-// check returns why a region cannot get new nodes, or nil.
+// check returns why a region cannot get new nodes, or nil. The SKU catalog comes first: a region
+// that has never loaded it reports that whatever else fails, so that ValidateSubnets keeps the
+// NodeClass not ready while the region has NodeClaims, instead of leaving it out of the catalog.
 func (r *Registry) check(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, region v1beta1.Region) error {
-	if err := r.validate(ctx, region); err != nil {
-		return fmt.Errorf("region %s subnet: %w", region.Name, err)
-	}
 	if _, err := r.get(ctx, region.Name); err != nil {
 		return err
+	}
+	if err := r.validate(ctx, region); err != nil {
+		return fmt.Errorf("region %s subnet: %w", region.Name, err)
 	}
 	if len(nodeClass.Status.Images) > 0 && !hasImageFor(nodeClass, region.Name) {
 		return fmt.Errorf("region %s has no node images", region.Name)
