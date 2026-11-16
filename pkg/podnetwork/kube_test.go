@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
 // fakeKubeCluster returns a KubeCluster whose cache and client are one fake client that holds objs.
@@ -125,25 +126,39 @@ func TestKubeClusterSetTaints(t *testing.T) {
 }
 
 // TestKubeClusterReadsTheCacheOnlyToList gives the cache and the client different versions of a
-// Node, as when the cache lags behind the API server. List reads the cache, and GetNode, which the
-// agent uses after a conflict, and CiliumConfig read the API server.
+// Node, a NodeNetworkConfig in kube-system and a NodeClaim, as when the cache lags behind the API
+// server. List reads all three from the cache, and GetNode, which the agent uses after a conflict,
+// and CiliumConfig read the API server.
 func TestKubeClusterReadsTheCacheOnlyToList(t *testing.T) {
 	g := NewWithT(t)
 	ctx := context.Background()
-	node := func(source string) *corev1.Node {
-		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: map[string]string{"example.com/source": source}}}
+	versions := func(source string) []client.Object {
+		labels := map[string]string{"example.com/source": source}
+		networkConfig := NetworkConfigObject()
+		networkConfig.SetNamespace(NetworkConfigNamespace)
+		networkConfig.SetName("node-1")
+		networkConfig.SetLabels(labels)
+		return []client.Object{
+			&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-1", Labels: labels}},
+			networkConfig,
+			&karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: "nodeclaim-1", Labels: labels}},
+		}
 	}
 	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "cilium-config"},
 		Data: map[string]string{"cni-exclusive": "false"}}
 	k := &KubeCluster{
-		Cache:  fakeKubeCluster(t, interceptor.Funcs{}, node("cache")).Cache,
-		Client: fakeKubeCluster(t, interceptor.Funcs{}, node("server"), config).Client,
+		Cache:  fakeKubeCluster(t, interceptor.Funcs{}, versions("cache")...).Cache,
+		Client: fakeKubeCluster(t, interceptor.Funcs{}, append(versions("server"), config)...).Client,
 	}
 
 	objects, err := k.List(ctx)
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(objects.Nodes).To(HaveLen(1))
 	g.Expect(objects.Nodes[0].Labels).To(HaveKeyWithValue("example.com/source", "cache"))
+	g.Expect(objects.NetworkConfigs).To(HaveLen(1))
+	g.Expect(objects.NetworkConfigs[0].GetLabels()).To(HaveKeyWithValue("example.com/source", "cache"))
+	g.Expect(objects.NodeClaims).To(HaveLen(1))
+	g.Expect(objects.NodeClaims[0].Labels).To(HaveKeyWithValue("example.com/source", "cache"))
 	fresh, err := k.GetNode(ctx, "node-1")
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(fresh.Labels).To(HaveKeyWithValue("example.com/source", "server"))
