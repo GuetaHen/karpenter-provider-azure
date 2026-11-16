@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -213,5 +214,27 @@ func TestRESTMapper(t *testing.T) {
 		g.Expect(mapping.Resource).To(Equal(kind.GroupVersion().WithResource(resource)), kind.Kind)
 		namespaced := mapping.Scope.Name() == meta.RESTScopeNameNamespace
 		g.Expect(namespaced).To(Equal(kind.Kind == "ConfigMap" || kind.Kind == "NodeNetworkConfig"), kind.Kind)
+	}
+
+	// A cache that holds the objects of only some namespaces, as the one of the NodeNetworkConfigs does,
+	// looks up the scope of a list by the kind of the list, so the list of every kind must map with the
+	// scope of its items.
+	scheme, err := NewScheme()
+	g.Expect(err).ToNot(HaveOccurred())
+	configs := &unstructured.UnstructuredList{}
+	configs.SetGroupVersionKind(NetworkConfigs.GroupVersion().WithKind("NodeNetworkConfigList"))
+	for _, tc := range []struct {
+		name       string
+		list       client.ObjectList
+		namespaced bool
+	}{
+		{"NodeList", &corev1.NodeList{}, false},
+		{"ConfigMapList", &corev1.ConfigMapList{}, true},
+		{"NodeClaimList", &karpv1.NodeClaimList{}, false},
+		{"NodeNetworkConfigList", configs, true},
+	} {
+		namespaced, mapErr := apiutil.IsObjectNamespaced(tc.list, scheme, mapper)
+		g.Expect(mapErr).ToNot(HaveOccurred(), tc.name)
+		g.Expect(namespaced).To(Equal(tc.namespaced), tc.name)
 	}
 }

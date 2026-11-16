@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package policysuite tests the admission policy of the pod network agent, which the karpenter chart
-// installs, against an API server.
+// Package policysuite tests, against an API server, what the pod network agent does there with the
+// permissions that the karpenter chart grants it: its cache and client, and the admission policy that
+// the chart installs.
 package policysuite

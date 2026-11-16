@@ -72,13 +72,19 @@ func NewScheme() (*runtime.Scheme, error) {
 }
 
 // NewRESTMapper returns the resources of the kinds that the agent reads and writes, so that it needs
-// no discovery request before it watches them.
+// no discovery request before it watches them. As a discovery RESTMapper does, it also maps the list
+// of every kind, with the scope of the kind: a cache that holds the objects of only some namespaces,
+// as the one of the NodeNetworkConfigs does, looks up the scope of a list by the kind of the list.
 func NewRESTMapper() meta.RESTMapper {
 	mapper := meta.NewDefaultRESTMapper(nil)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("Node"), meta.RESTScopeRoot)
-	mapper.Add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
-	mapper.Add(nodeClaimVersion.WithKind("NodeClaim"), meta.RESTScopeRoot)
-	mapper.Add(networkConfigKind, meta.RESTScopeNamespace)
+	add := func(kind schema.GroupVersionKind, scope meta.RESTScope) {
+		mapper.Add(kind, scope)
+		mapper.Add(kind.GroupVersion().WithKind(kind.Kind+"List"), scope)
+	}
+	add(corev1.SchemeGroupVersion.WithKind("Node"), meta.RESTScopeRoot)
+	add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
+	add(nodeClaimVersion.WithKind("NodeClaim"), meta.RESTScopeRoot)
+	add(networkConfigKind, meta.RESTScopeNamespace)
 	return mapper
 }
 
