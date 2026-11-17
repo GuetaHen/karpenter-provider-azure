@@ -572,7 +572,7 @@ func (p *DefaultVMProvider) newNetworkInterfaceForVM(opts *createNICOptions) arm
 			},
 			NetworkSecurityGroup:        nsgRef,
 			EnableAcceleratedNetworking: lo.ToPtr(enableAcceleratedNetworking),
-			EnableIPForwarding:          lo.ToPtr(false),
+			EnableIPForwarding:          lo.ToPtr(opts.EnableIPForwarding),
 		},
 	}
 	if opts.NetworkPlugin == consts.NetworkPluginAzure && opts.NetworkPluginMode != consts.NetworkPluginModeOverlay {
@@ -608,6 +608,7 @@ type createNICOptions struct {
 	NetworkPluginMode      string
 	MaxPods                int32
 	NetworkSecurityGroupID string
+	EnableIPForwarding     bool
 }
 
 func (p *DefaultVMProvider) createNetworkInterface(ctx context.Context, opts *createNICOptions) (string, error) {
@@ -998,6 +999,11 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		BackendPools:           backendPools,
 		InstanceType:           instanceType,
 		NetworkSecurityGroupID: nsgID,
+		// Like the NICs of AKS node pools, the NICs of the VMs of an AKSNodeClass with spec.regions
+		// forward IP packets: a pod on a regional node answers traffic that a home node forwarded to
+		// it, such as that of a Service with externalTrafficPolicy Cluster, with its own address as
+		// the source, which Azure drops at a NIC that does not forward.
+		EnableIPForwarding: len(nodeClass.Spec.Regions) > 0,
 	}
 
 	nicReference, err := p.createNetworkInterface(ctx, nicOpts)

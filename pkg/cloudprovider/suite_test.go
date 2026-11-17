@@ -606,6 +606,7 @@ var _ = Describe("CloudProvider", func() {
 					Expect(err).ToNot(HaveOccurred())
 					Expect(lo.FromPtr(nic.Location)).To(Equal(created.Labels[v1.LabelTopologyRegion]))
 					Expect(nic.Properties.NetworkSecurityGroup).To(BeNil(), "regional NSGs belong to the subnet, not the home-region NIC")
+					Expect(lo.FromPtr(nic.Properties.EnableIPForwarding)).To(BeTrue(), "the NICs of the VMs of an AKSNodeClass with spec.regions forward IP packets")
 					for _, config := range nic.Properties.IPConfigurations {
 						Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
 						target, found := lo.Find(nodeClass.Spec.Regions, func(r v1beta1.Region) bool { return r.Name == created.Labels[v1.LabelTopologyRegion] })
@@ -1046,6 +1047,17 @@ var _ = Describe("CloudProvider", func() {
 				for _, config := range nic.Properties.IPConfigurations {
 					Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(removed.VNETSubnetID))
 				}
+			})
+			It("should not forward IP packets on the NICs of an AKSNodeClass without spec.regions", func() {
+				nodeClass.Spec.Regions = nil
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod()
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nic.Properties.EnableIPForwarding).To(HaveValue(BeFalse()), "an AKSNodeClass without spec.regions keeps IP forwarding off")
 			})
 			It("should reject spec.regions before any Azure write when multi-region provisioning is disabled", func() {
 				testOptions.EnableMultiRegion = false
