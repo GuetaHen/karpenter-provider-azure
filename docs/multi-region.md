@@ -278,8 +278,13 @@ node's own transit address as source, so nothing relies on ARP or flooding. A
 connection that a node itself opens to a pod on a peer therefore carries
 the node's transit address, which Cilium treats as `world`: a NetworkPolicy
 that admits only cluster or node sources does not admit it. The agent accepts
-UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs into the
-tunnel. It does not start when the pod CIDR overlaps `169.254.0.0/16`, or when
+UDP 4789 only from peers' node IPs and sets TCP MSS 1360 on SYNs and SYN-ACKs
+into the tunnel. Pods keep the MTU that `cilium-cni` gives them, on regional
+nodes as on home nodes, so their packets into the tunnel can be longer than
+1400 bytes: TCP gets that MSS, and a longer packet of another protocol is
+fragmented at the bridge or, with the don't-fragment flag, dropped with an ICMP
+error that tells the sender the path MTU. It does not start when the pod CIDR
+overlaps `169.254.0.0/16`, or when
 the transit prefix is not inside `169.254.0.0/16`, has host bits, is too small
 for the pod CIDR or contains `169.254.169.254`. It programs the tunnel when it
 starts, once a minute, when what it must program changes and after a failed
@@ -299,16 +304,19 @@ regional node's peers are all other nodes, and there the agent also:
 
 - writes a CNI configuration that sorts before every other file in
   `/etc/cni/net.d`: the `cilium-cni` plugin with `host-local` IPAM over the
-  node's `/24` (addresses `.2` to `.254`, gateway `.1`), chained with the
-  `tuning` plugin for MTU 1400;
+  node's `/24` (addresses `.2` to `.254`, gateway `.1`);
 - masquerades pod traffic that leaves through the node's own interface;
 - drops forwarded traffic to `169.254.169.254`, so that pods cannot reach
   instance metadata.
 
 A regional node offers 253 pod addresses, so a NodeClass that sets `maxPods`
-above 253 is not supported on regional nodes. The plugins `cilium-cni`,
-`host-local` and `tuning` must be executable files in `/opt/cni/bin`; while one
-is missing, the agent keeps a regional node not ready.
+above 253 is not supported on regional nodes. The plugins `cilium-cni` and
+`host-local` must be executable files in `/opt/cni/bin`; while one is missing,
+the agent keeps a regional node not ready. The configuration leaves the MTU of
+the pods to `cilium-cni`: a lower MTU on a pod's interface would not lower what
+the pod sends, because `cilium-cni` gives the pod's routes Cilium's MTU, but
+the veth would silently drop longer packets on their way into the pod, such as
+full-size replies from outside the cluster.
 
 The agent writes that CNI file once the node's Cilium agent is healthy, and
 only while `/etc/cni/net.d` holds no other CNI configuration: pods started with

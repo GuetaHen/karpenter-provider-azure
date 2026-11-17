@@ -374,7 +374,7 @@ func TestAgentHandlesTheStartupTaintOfARegionalNode(t *testing.T) {
 	node.Finalizers = append(node.Finalizers, "example.com/hold")
 	g.Expect(kube.Client.Update(ctx, node)).To(Succeed())
 	g.Expect(kube.Client.Delete(ctx, node)).To(Succeed())
-	f.cniErr = errors.New("the CNI plugin tuning is not installed")
+	f.cniErr = errors.New("the CNI plugin host-local is not installed")
 	a.Pass(ctx, false)
 	g.Expect(a.Ready()).To(HaveOccurred())
 	g.Expect(taintKeys(t, kube, "regional-1")).To(BeEmpty())

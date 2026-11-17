@@ -44,11 +44,12 @@ func writeTestFile(t *testing.T, path, content string, mode os.FileMode) {
 	requireNoError(t, os.Chmod(path, mode))
 }
 
-// testCNI returns a CNI in temporary directories, with every plugin installed.
+// testCNI returns a CNI in temporary directories, with the plugins that its configuration names
+// installed and no other.
 func testCNI(t *testing.T) CNI {
 	t.Helper()
 	c := CNI{ConfDir: t.TempDir(), BinDir: t.TempDir()}
-	for _, plugin := range cniPlugins {
+	for _, plugin := range []string{"cilium-cni", "host-local"} {
 		writeTestFile(t, filepath.Join(c.BinDir, plugin), "", 0o700)
 	}
 	return c
@@ -87,7 +88,6 @@ func TestCNIConfig(t *testing.T) {
 		"plugins": []any{
 			map[string]any{"type": "cilium-cni", "ipam": map[string]any{
 				"type": "host-local", "ranges": []any{[]any{map[string]any{"subnet": "10.244.3.0/24"}}}}},
-			map[string]any{"type": "tuning", "mtu": float64(1400)},
 		},
 	}))
 }
@@ -108,10 +108,6 @@ func TestCNIConfigBytes(t *testing.T) {
         "type": "host-local",
         "ranges": [[{"subnet": "10.244.3.0/24"}]]
       }
-    },
-    {
-      "type": "tuning",
-      "mtu": 1400
     }
   ]
 }
@@ -172,7 +168,7 @@ func TestCNIEnsureRefusesAndChangesNothing(t *testing.T) {
 			writeTestFile(t, filepath.Join(c.ConfDir, "00-azure.conflist"), "{}", 0o600)
 		},
 		"a missing plugin": func(t *testing.T, c CNI) {
-			requireNoError(t, os.Remove(filepath.Join(c.BinDir, "tuning")))
+			requireNoError(t, os.Remove(filepath.Join(c.BinDir, "host-local")))
 		},
 		"a plugin that is not executable": func(t *testing.T, c CNI) {
 			requireNoError(t, os.Chmod(filepath.Join(c.BinDir, "cilium-cni"), 0o600))

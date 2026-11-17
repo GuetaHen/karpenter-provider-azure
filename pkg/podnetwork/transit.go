@@ -30,9 +30,14 @@ const (
 	DefaultTransitPrefix = "169.254.64.0/18"
 	// TunnelPort is the UDP port of the VXLAN tunnel.
 	TunnelPort = 4789
-	// TunnelMTU is the MTU of the tunnel devices and of the pods on regional nodes.
+	// TunnelMTU is the MTU of the tunnel devices; with the 50 bytes of VXLAN encapsulation it fits a
+	// node network with MTU 1500. Pods keep the MTU that cilium-cni gives them, on regional nodes as on
+	// home nodes, so their traffic into the tunnel can be longer: TCP gets TunnelMSS, and a longer
+	// packet of other traffic is fragmented at the bridge or, with the don't-fragment flag, dropped
+	// with an ICMP error that tells the sender the path MTU.
 	TunnelMTU = 1400
-	// TunnelMSS is the TCP MSS that the agent sets on SYNs into the tunnel.
+	// TunnelMSS is the TCP MSS that the agent sets on SYNs and SYN-ACKs into the tunnel: TunnelMTU less
+	// the 40 bytes of the IPv4 and TCP headers.
 	TunnelMSS = 1360
 )
 

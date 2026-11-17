@@ -39,7 +39,7 @@ const (
 
 var (
 	// cniPlugins are the plugins that the CNI configuration of the agent names.
-	cniPlugins = []string{"cilium-cni", "host-local", "tuning"}
+	cniPlugins = []string{"cilium-cni", "host-local"}
 	// cniConfigExtensions are the extensions of the files that the container runtime reads as CNI
 	// configurations.
 	cniConfigExtensions = []string{".conf", ".conflist", ".json"}
@@ -47,7 +47,10 @@ var (
 
 // cniConfigTemplate is the CNI configuration of a regional node: the cilium-cni plugin with host-local
 // IPAM over the whole pod range of the node, of which host-local keeps the first address as the
-// gateway, chained with the tuning plugin for the MTU of the tunnel.
+// gateway. Pods get the MTU that cilium-cni sets, as on home nodes. A lower MTU on the interface of a
+// pod would not lower what the pod sends, because cilium-cni gives the routes of the pod the MTU of
+// Cilium, which sizes its packets and its TCP MSS; it would only make the veth drop longer packets on
+// their way into the pod, without an ICMP error. See TunnelMTU for traffic into the tunnel.
 const cniConfigTemplate = `{
   "cniVersion": "0.3.1",
   "name": "karpenter-pod-network",
@@ -58,10 +61,6 @@ const cniConfigTemplate = `{
         "type": "host-local",
         "ranges": [[{"subnet": %q}]]
       }
-    },
-    {
-      "type": "tuning",
-      "mtu": %d
     }
   ]
 }
@@ -69,7 +68,7 @@ const cniConfigTemplate = `{
 
 // CNIConfig returns the CNI configuration of a regional node whose pod range is podRange.
 func CNIConfig(podRange netip.Prefix) []byte {
-	return fmt.Appendf(nil, cniConfigTemplate, podRange.String(), TunnelMTU)
+	return fmt.Appendf(nil, cniConfigTemplate, podRange.String())
 }
 
 // CNI writes the CNI configuration of a regional node.

@@ -57,8 +57,8 @@ func (f *nftablesFirewall) Apply(plan Plan) error {
 
 // firewallRules returns the table of the agent for plan:
 //   - input: UDP to the tunnel port only from the node IPs of the peers;
-//   - forward: the TCP MSS of SYNs into the tunnel and, on a regional node, a drop of forwarded
-//     traffic to instance metadata;
+//   - forward: the TCP MSS of SYNs and SYN-ACKs into the tunnel and, on a regional node, a drop of
+//     forwarded traffic to instance metadata;
 //   - postrouting, on a regional node only: masquerade of pod traffic that leaves through neither
 //     the tunnel nor to the pod CIDR.
 func firewallRules(plan Plan) (*nftables.Table, []*nftables.Chain, *nftables.Set, []nftables.SetElement, []*nftables.Rule) {
@@ -98,8 +98,12 @@ func tunnelFilter(set string) []expr.Any {
 	}
 }
 
-// mssClamp lowers the TCP MSS option of SYNs that leave through the bridge into the tunnel to
-// TunnelMSS; the kernel never raises an MSS option.
+// mssClamp lowers the TCP MSS option of SYNs and SYN-ACKs that leave through the bridge into the
+// tunnel to TunnelMSS; the kernel never raises an MSS option. Pods advertise the MSS of the route MTU
+// that cilium-cni gives them, which is more than the tunnel takes, so this keeps the TCP segments of
+// both directions within TunnelMTU. Pod traffic reaches the forward hook because the agent requires
+// legacy host routing, under which Cilium hands it to the routes of the kernel instead of redirecting
+// it in eBPF.
 func mssClamp() []expr.Any {
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
