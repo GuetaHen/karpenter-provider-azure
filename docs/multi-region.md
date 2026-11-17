@@ -325,10 +325,16 @@ AKS, Azure CNS writes the CNI configuration of the Cilium dataplane only after
 the Azure host reports the node's network container as programmed, and hands
 out no pod address until then. Once the agent's file is in place, a later CNI
 configuration does not matter, and an earlier one makes the node not ready.
-The agent never rewrites its file and refuses a node whose file holds other
-bytes, so an agent version that changes the content of the file keeps every
-regional node that holds the file of an earlier version not ready and tainted
-until the node is replaced.
+The agent refuses a node whose file holds other bytes, with one exception: it
+replaces the file that the previous agent version wrote for the node's `/24`,
+which also chained the `tuning` plugin for MTU 1400, unless another CNI
+configuration sorts before it. It writes its file under a temporary name that
+the container runtime ignores and renames it over the old one, so that the
+runtime reads either file whole. Both files name the same network and range,
+so `host-local` keeps the addresses that it handed out. Pods that already run
+on the node keep MTU 1400 until they are recreated, so longer packets on their
+way into such a pod are still dropped. A file of an older version or of
+another range keeps the node not ready and tainted until the node is replaced.
 
 The agent re-checks a peer on every change of its Node, NodeClaim or
 `NodeNetworkConfig`, re-validates everything every 60 seconds, and removes a

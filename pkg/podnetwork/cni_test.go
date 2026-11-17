@@ -92,10 +92,11 @@ func TestCNIConfig(t *testing.T) {
 	}))
 }
 
-// TestCNIConfigBytes pins the exact bytes of the CNI configuration for one range. The agent never
-// rewrites its file and refuses a node whose file holds other bytes, so any change of these bytes,
-// even of the layout, keeps every regional node that holds the file of an earlier agent not ready and
-// tainted until the node is replaced.
+// TestCNIConfigBytes pins the exact bytes of the CNI configuration for one range. The agent replaces
+// only the file of its previous version and refuses a node whose file holds other bytes, so a change
+// of these bytes, even of the layout, must make them those of previousCNIConfigTemplate; otherwise
+// every regional node that holds the file of the earlier agent stays not ready and tainted until the
+// node is replaced.
 func TestCNIConfigBytes(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(string(CNIConfig(testPodRange))).To(Equal(`{
@@ -108,6 +109,31 @@ func TestCNIConfigBytes(t *testing.T) {
         "type": "host-local",
         "ranges": [[{"subnet": "10.244.3.0/24"}]]
       }
+    }
+  ]
+}
+`))
+}
+
+// TestPreviousCNIConfigBytes pins the exact bytes of the CNI configuration that the previous version
+// of the agent wrote for one range, which the agent replaces: those that TestCNIConfigBytes pinned
+// before the tuning plugin left the configuration.
+func TestPreviousCNIConfigBytes(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(string(previousCNIConfig(testPodRange))).To(Equal(`{
+  "cniVersion": "0.3.1",
+  "name": "karpenter-pod-network",
+  "plugins": [
+    {
+      "type": "cilium-cni",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": "10.244.3.0/24"}]]
+      }
+    },
+    {
+      "type": "tuning",
+      "mtu": 1400
     }
   ]
 }
@@ -152,6 +178,26 @@ func TestCNIEnsure(t *testing.T) {
 	g.Expect(cniConfigState(c.ConfDir)).To(Equal(written))
 }
 
+// TestCNIEnsureReplacesThePreviousConfiguration upgrades a node that holds the CNI configuration that
+// the previous version of the agent wrote.
+func TestCNIEnsureReplacesThePreviousConfiguration(t *testing.T) {
+	skipEnsureOnWindows(t)
+	g := NewWithT(t)
+	c := testCNI(t)
+	written := "---------- " + string(CNIConfig(testPodRange))
+	writeTestFile(t, filepath.Join(c.ConfDir, CNIConfigName), string(previousCNIConfig(testPodRange)), 0o600)
+	// A configuration that sorts after it does not stop the replacement.
+	writeTestFile(t, filepath.Join(c.ConfDir, "05-cilium.conflist"), "{}", 0o600)
+
+	g.Expect(c.Ensure(testPodRange)).To(Succeed())
+	g.Expect(cniConfigState(c.ConfDir)).To(Equal(written))
+	g.Expect(dirNames(t, c.ConfDir)).To(ConsistOf("05-cilium.conflist", CNIConfigName))
+
+	// The agent keeps the file that replaced it.
+	g.Expect(c.Ensure(testPodRange)).To(Succeed())
+	g.Expect(cniConfigState(c.ConfDir)).To(Equal(written))
+}
+
 func TestCNIEnsureRefusesAndChangesNothing(t *testing.T) {
 	skipEnsureOnWindows(t)
 	for name, prepare := range map[string]func(t *testing.T, c CNI){
@@ -180,6 +226,14 @@ func TestCNIEnsureRefusesAndChangesNothing(t *testing.T) {
 		"another configuration under its name": func(t *testing.T, c CNI) {
 			other := CNIConfig(netip.MustParsePrefix("10.244.4.0/24"))
 			writeTestFile(t, filepath.Join(c.ConfDir, CNIConfigName), string(other), 0o600)
+		},
+		"the previous configuration of another range under its name": func(t *testing.T, c CNI) {
+			other := previousCNIConfig(netip.MustParsePrefix("10.244.4.0/24"))
+			writeTestFile(t, filepath.Join(c.ConfDir, CNIConfigName), string(other), 0o600)
+		},
+		"the previous configuration under its name after an earlier configuration": func(t *testing.T, c CNI) {
+			writeTestFile(t, filepath.Join(c.ConfDir, CNIConfigName), string(previousCNIConfig(testPodRange)), 0o600)
+			writeTestFile(t, filepath.Join(c.ConfDir, "00-azure.conflist"), "{}", 0o600)
 		},
 		"a directory under its name": func(t *testing.T, c CNI) {
 			requireNoError(t, os.Mkdir(filepath.Join(c.ConfDir, CNIConfigName), 0o700))

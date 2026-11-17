@@ -71,6 +71,35 @@ func CNIConfig(podRange netip.Prefix) []byte {
 	return fmt.Appendf(nil, cniConfigTemplate, podRange.String())
 }
 
+// previousCNIConfigTemplate is the CNI configuration that the previous version of the agent wrote on
+// a regional node, which also chained the tuning plugin for the MTU of the tunnel. The agent replaces
+// a file that holds it for the pod range of the node and refuses a file with any other content, so a
+// change of cniConfigTemplate must move the current template here.
+const previousCNIConfigTemplate = `{
+  "cniVersion": "0.3.1",
+  "name": "karpenter-pod-network",
+  "plugins": [
+    {
+      "type": "cilium-cni",
+      "ipam": {
+        "type": "host-local",
+        "ranges": [[{"subnet": %q}]]
+      }
+    },
+    {
+      "type": "tuning",
+      "mtu": 1400
+    }
+  ]
+}
+`
+
+// previousCNIConfig returns the CNI configuration that the previous version of the agent wrote on a
+// regional node whose pod range is podRange.
+func previousCNIConfig(podRange netip.Prefix) []byte {
+	return fmt.Appendf(nil, previousCNIConfigTemplate, podRange.String())
+}
+
 // CNI writes the CNI configuration of a regional node.
 type CNI struct {
 	// ConfDir holds the CNI configurations of the node, and BinDir its CNI plugins.
@@ -78,12 +107,27 @@ type CNI struct {
 	BinDir  string
 }
 
+// cniFile is what the file of the agent's CNI configuration holds.
+type cniFile int
+
+const (
+	// cniFileAbsent means that there is no file under its name.
+	cniFileAbsent cniFile = iota
+	// cniFileCurrent is the CNI configuration of the agent for the pod range of the node.
+	cniFileCurrent
+	// cniFilePrevious is the CNI configuration that the previous version of the agent wrote for that
+	// range.
+	cniFilePrevious
+)
+
 // Ensure puts the CNI configuration for podRange in place, and returns nil once it is in place and
 // in use: every plugin that it names is installed and no other CNI configuration sorts before it. It
 // writes the file only while the directory holds no other CNI configuration, because pods may hold
 // addresses that another configuration handed out and host-local does not know; once the file is in
-// place, a later configuration does not matter. It never changes or removes a file of its name: one
-// with other content, or that is not a regular file, is refused.
+// place, a later configuration does not matter. It replaces a file of its name only when that holds
+// what the previous version of the agent wrote for podRange and no other configuration sorts before
+// it: both name the same network and range, so host-local keeps the addresses that it handed out. A
+// file of its name with other content, or that is not a regular file, is refused and stays.
 func (c CNI) Ensure(podRange netip.Prefix) error {
 	if err := c.checkPlugins(); err != nil {
 		return err
@@ -94,7 +138,7 @@ func (c CNI) Ensure(podRange netip.Prefix) error {
 	}
 	defer root.Close()
 	want := CNIConfig(podRange)
-	exists, err := ownConfig(root, want)
+	file, err := ownConfig(root, want, previousCNIConfig(podRange))
 	if err != nil {
 		return err
 	}
@@ -102,10 +146,12 @@ func (c CNI) Ensure(podRange netip.Prefix) error {
 	switch {
 	case err != nil:
 		return err
-	case exists && len(others) > 0 && others[0] < CNIConfigName:
+	case file != cniFileAbsent && sortsBeforeOwn(others):
 		return fmt.Errorf("the CNI configuration %s sorts before %s", others[0], CNIConfigName)
-	case exists:
+	case file == cniFileCurrent:
 		return nil
+	case file == cniFilePrevious:
+		return replaceCNIConfig(root, want)
 	case len(others) > 0:
 		return fmt.Errorf("%s holds %s before the agent's CNI configuration: pods may hold addresses that host-local does not know",
 			c.ConfDir, strings.Join(others, ", "))
@@ -113,26 +159,35 @@ func (c CNI) Ensure(podRange netip.Prefix) error {
 	return writeCNIConfig(root, want)
 }
 
-// ownConfig reports whether the agent's CNI configuration is in place with the content want. A file
-// of its name that is not a regular file or holds other content is an error.
-func ownConfig(root *os.Root, want []byte) (bool, error) {
+// sortsBeforeOwn reports whether the first of the sorted other CNI configurations sorts before the
+// agent's.
+func sortsBeforeOwn(others []string) bool {
+	return len(others) > 0 && others[0] < CNIConfigName
+}
+
+// ownConfig reports what the file of the agent's CNI configuration holds: nothing, the content want
+// or the content previous. A file of its name that is not a regular file or holds other content is
+// an error.
+func ownConfig(root *os.Root, want, previous []byte) (cniFile, error) {
 	info, err := root.Lstat(CNIConfigName)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
-		return false, nil
+		return cniFileAbsent, nil
 	case err != nil:
-		return false, fmt.Errorf("reading the CNI configuration: %w", err)
+		return cniFileAbsent, fmt.Errorf("reading the CNI configuration: %w", err)
 	case !info.Mode().IsRegular():
-		return false, fmt.Errorf("%s is not a regular file", CNIConfigName)
+		return cniFileAbsent, fmt.Errorf("%s is not a regular file", CNIConfigName)
 	}
 	got, err := root.ReadFile(CNIConfigName)
-	if err != nil {
-		return false, fmt.Errorf("reading the CNI configuration: %w", err)
+	switch {
+	case err != nil:
+		return cniFileAbsent, fmt.Errorf("reading the CNI configuration: %w", err)
+	case bytes.Equal(got, want):
+		return cniFileCurrent, nil
+	case bytes.Equal(got, previous):
+		return cniFilePrevious, nil
 	}
-	if !bytes.Equal(got, want) {
-		return false, fmt.Errorf("%s holds another configuration than the agent's", CNIConfigName)
-	}
-	return true, nil
+	return cniFileAbsent, fmt.Errorf("%s holds another configuration than the agent's", CNIConfigName)
 }
 
 // checkPlugins requires every plugin that the CNI configuration names to be an executable file.
@@ -169,8 +224,20 @@ func otherConfigs(root *os.Root) ([]string, error) {
 }
 
 // writeCNIConfig creates the CNI configuration without replacing a file that appeared meanwhile: it
-// writes a temporary file, which the container runtime ignores, and links it to its name.
+// links the temporary file to its name.
 func writeCNIConfig(root *os.Root, content []byte) error {
+	return putCNIConfig(root, content, root.Link)
+}
+
+// replaceCNIConfig replaces the CNI configuration: it renames the temporary file over the old one, so
+// that the container runtime reads either the old or the new configuration whole.
+func replaceCNIConfig(root *os.Root, content []byte) error {
+	return putCNIConfig(root, content, root.Rename)
+}
+
+// putCNIConfig writes content to a temporary file, which the container runtime ignores, and puts that
+// file under the name of the CNI configuration with put.
+func putCNIConfig(root *os.Root, content []byte, put func(oldname, newname string) error) error {
 	if err := root.Remove(cniTempName); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("removing a temporary CNI configuration: %w", err)
 	}
@@ -187,7 +254,7 @@ func writeCNIConfig(root *os.Root, content []byte) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = root.Link(cniTempName, CNIConfigName)
+		err = put(cniTempName, CNIConfigName)
 	}
 	if err != nil {
 		return fmt.Errorf("writing the CNI configuration: %w", err)
