@@ -162,6 +162,50 @@ controller:
   healthProbe:
     # -- The container port to use for http health probe.
     port: 8081
+podNetworkAgent:
+  # -- Run the pod network agent as a DaemonSet on every Linux node. It supplies the pod network of regional nodes on
+  # Azure CNI Overlay with the AKS-managed Cilium dataplane, as docs/multi-region.md describes. The controller then
+  # needs --enable-multi-region and --multi-region-external-pod-network, and the chart passes it the startup taint key.
+  enabled: false
+  image:
+    # -- Repository path to the agent image, which the release does not publish. Required with the agent.
+    repository: ""
+    # -- Tag of the agent image. The image needs a tag, a digest or both.
+    tag: ""
+    # -- SHA256 digest of the agent image.
+    digest: ""
+  # -- Command of the agent container, for an image that holds the agent beside other programs. Empty runs the
+  # entrypoint of the image.
+  command: []
+  # -- Pod CIDR of the cluster. Required with the agent.
+  podCIDR: ""
+  # -- ARM ID of the resource group that holds the VMs of all nodes. Required with the agent.
+  nodeResourceGroupID: ""
+  # -- Link-local prefix that holds the transit address of every node.
+  transitPrefix: 169.254.64.0/18
+  # -- Key of the startup taint that the agent removes once a node's pod network is ready. Every NodePool whose
+  # AKSNodeClass lists regions must carry it in its startupTaints.
+  startupTaintKey: karpenter.azure.com/regional-pod-network-not-ready
+  apiServer:
+    # -- Host of the API server for the agent. When set, the agent reaches the API server there instead of through
+    # the kubernetes Service, which a new node serves only once its Cilium agent runs.
+    host: ""
+    # -- Port of the API server for the agent, with apiServer.host.
+    port: 443
+  # -- Loopback port on which the agent serves /healthz and /readyz.
+  probePort: 9887
+  # -- PriorityClass name of the agent pods.
+  priorityClassName: system-node-critical
+  # -- Number or percentage of agent pods that a rollout replaces at a time, never with surge, so that two agents never
+  # program one node. The pod on a node that the agent refuses stays unready and counts against it, so that this many
+  # refused nodes stall every rollout.
+  maxUnavailable: 1
+  # -- Resources of the agent container.
+  resources: {}
+  admissionPolicy:
+    # -- Install a ValidatingAdmissionPolicy that lets the agent patch only its own Node and only the startup taint.
+    # It recognizes the agent's Node by the node name in its service account token, which Kubernetes adds from 1.30.
+    enabled: true
 webhook:
   # -- Whether to enable the webhooks and webhook permissions.
   enabled: true

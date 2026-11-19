@@ -1,0 +1,255 @@
+{{- if include "karpenter.podNetworkAgent.enabled" . }}
+{{- $agent := .Values.podNetworkAgent }}
+{{- $name := include "karpenter.podNetworkAgent.name" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch"]
+  # The agent only lists and watches NodeClaims and NodeNetworkConfigs, through its cache.
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodeclaims"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: kube-system
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+rules:
+  - apiGroups: ["acn.azure.com"]
+    resources: ["nodenetworkconfigs"]
+    verbs: ["list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cilium-config"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: kube-system
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  selector:
+    matchLabels:
+      {{- include "karpenter.podNetworkAgent.selectorLabels" . | nindent 6 }}
+  # Two agents never program one node: a node's agent is replaced only after it stopped.
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: {{ .Values.podNetworkAgent.maxUnavailable }}
+  template:
+    metadata:
+      labels:
+        {{- include "karpenter.podNetworkAgent.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      # A pass ends within 45 seconds, and the agent finishes a running pass before it exits.
+      terminationGracePeriodSeconds: 60
+      hostNetwork: true
+      # The agent needs no cluster DNS, which a new node serves only once its Cilium agent runs.
+      dnsPolicy: Default
+      priorityClassName: {{ $agent.priorityClassName | quote }}
+      nodeSelector:
+        kubernetes.io/os: linux
+      # Virtual nodes cannot run the agent, so it stays off them, as the AKS DaemonSets do.
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: type
+                    operator: NotIn
+                    values: ["virtual-kubelet"]
+      # The agent must run on a node that still carries the startup taint that it removes.
+      tolerations:
+        - operator: Exists
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pod-network-agent
+          image: {{ include "karpenter.podNetworkAgent.image" . }}
+          imagePullPolicy: {{ .Values.imagePullPolicy }}
+          {{- with $agent.command }}
+          command:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_ADMIN
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_CIDR
+              value: {{ required "podNetworkAgent.podCIDR is required" $agent.podCIDR | quote }}
+            - name: NODE_RESOURCE_GROUP_ID
+              value: {{ required "podNetworkAgent.nodeResourceGroupID is required" $agent.nodeResourceGroupID | quote }}
+            - name: NODE_CLASS_GROUP
+              value: "karpenter.azure.com"
+            - name: TRANSIT_PREFIX
+              value: {{ $agent.transitPrefix | quote }}
+            - name: STARTUP_TAINT_KEY
+              value: {{ $agent.startupTaintKey | quote }}
+            - name: PROBE_ADDRESS
+              value: {{ printf "127.0.0.1:%v" $agent.probePort | quote }}
+          {{- with $agent.apiServer.host }}
+            - name: KUBERNETES_SERVICE_HOST
+              value: {{ . | quote }}
+            - name: KUBERNETES_SERVICE_PORT
+              value: {{ $agent.apiServer.port | quote }}
+          {{- end }}
+          readinessProbe:
+            periodSeconds: 5
+            httpGet:
+              host: 127.0.0.1
+              path: /readyz
+              port: {{ $agent.probePort }}
+          livenessProbe:
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            httpGet:
+              host: 127.0.0.1
+              path: /healthz
+              port: {{ $agent.probePort }}
+          {{- with $agent.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: cni-conf
+              mountPath: /etc/cni/net.d
+            - name: cni-bin
+              mountPath: /opt/cni/bin
+              readOnly: true
+      volumes:
+        - name: cni-conf
+          hostPath:
+            path: /etc/cni/net.d
+            type: DirectoryOrCreate
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: Directory
+{{- if $agent.admissionPolicy.enabled }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- .Files.Get "files/pod-network-agent-policy.yaml" | replace "__AGENT_USERNAME__" (printf "system:serviceaccount:%s:%s" .Release.Namespace $name) | replace "__STARTUP_TAINT_KEY__" $agent.startupTaintKey | nindent 2 }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  policyName: {{ $name }}
+  validationActions:
+    - Deny
+{{- end }}
+{{- end }}

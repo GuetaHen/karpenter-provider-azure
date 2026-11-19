@@ -4,3 +4,10 @@ defaultPlatforms:
   - linux/amd64
 defaultEnv:
   - CGO_ENABLED=1
+builds:
+  # Unlike the controller, the pod network agent builds without cgo, so that any host builds its image for
+  # both architectures and its binary runs in any image.
+  - id: pod-network-agent
+    main: ./cmd/pod-network-agent
+    env:
+      - CGO_ENABLED=0
