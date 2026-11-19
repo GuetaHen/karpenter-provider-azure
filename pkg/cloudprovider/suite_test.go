@@ -51,6 +51,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/controllers/capacitybuffer"
 	"sigs.k8s.io/karpenter/pkg/controllers/dynamicresources/deviceallocation"
 	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
+	nodeclaimdisruption "sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/disruption"
 	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/controllers/provisioning"
 	"sigs.k8s.io/karpenter/pkg/controllers/state"
@@ -561,6 +562,23 @@ var _ = Describe("CloudProvider", func() {
 				cloudProvider.WaitForInstancePromises()
 				remote.Reset(ctx)
 			})
+			It("should not accept another region's image as the current image during drift checks", func() {
+				nodeClass.Status.Images = []v1beta1.NodeImage{
+					{ID: "gallery/image/versions/1", Requirements: []v1.NodeSelectorRequirement{{Key: v1.LabelTopologyRegion, Operator: v1.NodeSelectorOpIn, Values: []string{fake.Region}}}},
+					{ID: "gallery/image/versions/2", Requirements: []v1.NodeSelectorRequirement{{Key: v1.LabelTopologyRegion, Operator: v1.NodeSelectorOpIn, Values: []string{fake.RegionNonZonal}}}},
+				}
+				ExpectApplied(ctx, env.Client, nodeClass)
+				current := ExpectExists(ctx, env.Client, nodeClass)
+				nodeClaim.Labels[v1.LabelTopologyRegion] = fake.RegionNonZonal
+				nodeClaim.Status.ImageID = "gallery/image/versions/1"
+				drift, err := cloudProvider.isImageVersionDrifted(ctx, nodeClaim, current)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(drift).To(Equal(ImageDrift))
+				nodeClaim.Status.ImageID = "gallery/image/versions/2"
+				drift, err = cloudProvider.isImageVersionDrifted(ctx, nodeClaim, current)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(drift).To(BeEmpty())
+			})
 			It("should isolate quota and capacity failures for regional zone zero", func() {
 				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 				sku := fake.MakeSKU("Standard_D2_v3")
@@ -659,6 +677,48 @@ var _ = Describe("CloudProvider", func() {
 				}
 				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2), "retries must adopt the original VM")
 				Expect(azureEnv.LoadBalancersAPI.NewListPagerBehavior.CalledWithInput.Len()).To(BeZero())
+			})
+			It("should give VMs in other regions the identities and kubelet identity of their region", func() {
+				globalIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/global"
+				regionIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/remote"
+				// An add-on identity that every node carries is listed globally and in each per-region entry.
+				addonIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/addon"
+				regionClientID := "11111111-2222-3333-4444-555555555555"
+				testOptions.NodeIdentities = []string{globalIdentity, addonIdentity}
+				testOptions.MultiRegionNodeIdentities = map[string]options.MultiRegionNodeIdentity{
+					fake.RegionNonZonal: {NodeIdentities: []string{regionIdentity, addonIdentity}, KubeletIdentityClientID: regionClientID},
+				}
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+				created := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+				Expect(lo.FromPtr(created.Location)).To(Equal(fake.RegionNonZonal))
+				Expect(lo.Keys(created.Identity.UserAssignedIdentities)).To(ConsistOf(regionIdentity, addonIdentity), "the per-region entry replaces the global identities")
+				customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(created.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(customData)).To(ContainSubstring(v1beta1.AKSLabelKubeletIdentityClientID + "=" + regionClientID))
+				Expect(string(customData)).ToNot(ContainSubstring(testOptions.KubeletIdentityClientID))
+				Expect(string(customData)).ToNot(ContainSubstring("test-kubelet-identity-client-id"))
+
+				// A retried launch adopts the VM in the other region and attaches no global identity.
+				claims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, claims)).To(Succeed())
+				Expect(claims.Items).To(HaveLen(1))
+				retried, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, &claims.Items[0])
+				Expect(err).ToNot(HaveOccurred())
+				Expect(retried.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.RegionNonZonal))
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero(), "the retry adopts the existing VM")
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineUpdateBehavior.Calls()).To(BeZero(), "adoption attaches no identity")
+
+				// The cluster region has no entry, so its VMs get every global identity.
+				homePod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.Region, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, homePod)
+				ExpectScheduled(ctx, env.Client, homePod)
+				home := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM
+				Expect(lo.FromPtr(home.Location)).To(Equal(fake.Region))
+				Expect(lo.Keys(home.Identity.UserAssignedIdentities)).To(ConsistOf(globalIdentity, addonIdentity))
 			})
 			It("should exclude multi-region nodes from load balancers and place their NICs in the subnet of their region", func() {
 				regionSubnetID := fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/remote-vnet/subnets/remote-nodes", azureEnv.SubscriptionID)
@@ -796,6 +856,81 @@ var _ = Describe("CloudProvider", func() {
 				_, found := azureEnv.VirtualMachinesAPI.Instances.Load(lo.FromPtr(vm.ID))
 				Expect(found).To(BeFalse(), "the VM of the removed region is deleted")
 			})
+			It("should serve a region again after it was removed and its network deleted and created again, without a restart", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				node := ExpectScheduled(ctx, env.Client, pod)
+				Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.RegionNonZonal))
+				nodeClaims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+				Expect(nodeClaims.Items).To(HaveLen(1))
+				claim := &nodeClaims.Items[0]
+				remoteAvailable := func() bool {
+					GinkgoHelper()
+					instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+					Expect(err).ToNot(HaveOccurred())
+					return lo.ContainsBy(instanceTypes, func(instanceType *corecloudprovider.InstanceType) bool {
+						return lo.ContainsBy(instanceType.Offerings.Available(), func(offering *corecloudprovider.Offering) bool {
+							return offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.RegionNonZonal)
+						})
+					})
+				}
+				// observed applies a spec change and stands in for the status controller, which records the
+				// NodeClass generation that its checks saw.
+				observed := func() {
+					GinkgoHelper()
+					ExpectApplied(ctx, env.Client, nodeClass)
+					conditions := nodeClass.GetConditions()
+					for i := range conditions {
+						conditions[i].ObservedGeneration = nodeClass.Generation
+					}
+					nodeClass.SetConditions(conditions)
+					ExpectApplied(ctx, env.Client, nodeClass)
+				}
+
+				// The region leaves the NodeClass: its NodeClaim drifts, and the replacement deletes its VM and node.
+				home, removed := nodeClass.Spec.Regions[0], nodeClass.Spec.Regions[1]
+				nodeClass.Spec.Regions = []v1beta1.Region{home}
+				observed()
+				Expect(cloudProvider.IsDrifted(ctx, claim)).To(Equal(MultiRegionPlacementDrift))
+				Expect(cloudProvider.Delete(ctx, claim)).To(Succeed())
+				ExpectFinalizersRemoved(ctx, env.Client, claim, node)
+				ExpectDeleted(ctx, env.Client, claim, node)
+				cluster.DeleteNodeClaim(claim.Name)
+				cluster.DeleteNode(node.Name)
+
+				// The region's network is deleted. While the region is not listed, nothing checks or offers it.
+				regionErrs[fake.RegionNonZonal] = errors.New("synthetic ResourceGroupNotFound")
+				Expect(registry.ValidateSubnets(ctx, nodeClass)).To(Succeed())
+				Expect(remoteAvailable()).To(BeFalse())
+
+				// Listed again before its network exists, the region gets no new nodes.
+				nodeClass.Spec.Regions = []v1beta1.Region{home, removed}
+				observed()
+				var partial interface{ UnavailableRegions() []string }
+				Expect(errors.As(registry.ValidateSubnets(ctx, nodeClass), &partial)).To(BeTrue())
+				Expect(partial.UnavailableRegions()).To(ConsistOf(fake.RegionNonZonal))
+				Expect(remoteAvailable()).To(BeFalse())
+				pod = coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectNotScheduled(ctx, env.Client, pod)
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+
+				// Once the network exists again, the same registry and providers serve the region on it.
+				delete(regionErrs, fake.RegionNonZonal)
+				Expect(registry.ValidateSubnets(ctx, nodeClass)).To(Succeed())
+				Expect(remoteAvailable()).To(BeTrue())
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				Expect(lo.FromPtr(input.VM.Location)).To(Equal(fake.RegionNonZonal))
+				nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				for _, config := range nic.Properties.IPConfigurations {
+					Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(removed.VNETSubnetID))
+				}
+			})
 			It("should label a VM with its location only while multi-region provisioning is enabled", func() {
 				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
 				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
@@ -892,6 +1027,95 @@ var _ = Describe("CloudProvider", func() {
 				plainProvisioner := provisioning.NewProvisioner(env.Client, recorder, plain, cluster, fakeClock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
 				Expect(launch(plain, plainProvisioner)).To(Equal(enabled))
 			})
+			It("should drift a NodeClaim in a removed region with InstanceTypeNotFound once core checks its instance type", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				nodeClaims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+				Expect(nodeClaims.Items).To(HaveLen(1))
+				claim := &nodeClaims.Items[0]
+				Expect(claim.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.RegionNonZonal))
+				// The region leaves the NodeClass. Recording the new generation in the conditions stands in
+				// for the status controller.
+				nodeClass.Spec.Regions = nodeClass.Spec.Regions[:1]
+				ExpectApplied(ctx, env.Client, nodeClass)
+				conditions := nodeClass.GetConditions()
+				for i := range conditions {
+					conditions[i].ObservedGeneration = nodeClass.Generation
+				}
+				nodeClass.SetConditions(conditions)
+				ExpectApplied(ctx, env.Client, nodeClass)
+				start := fakeClock.Now()
+				DeferCleanup(func() { fakeClock.SetTime(start) })
+				disruptionController := nodeclaimdisruption.NewController(fakeClock, env.Client, cloudProvider)
+				driftReason := func() string {
+					GinkgoHelper()
+					ExpectObjectReconciled(ctx, env.Client, disruptionController, claim)
+					drifted := ExpectExists(ctx, env.Client, claim).StatusConditions().Get(karpv1.ConditionTypeDrifted)
+					Expect(drifted).ToNot(BeNil())
+					Expect(drifted.IsTrue()).To(BeTrue())
+					return drifted.Reason
+				}
+				// Core checks the instance type of a NodeClaim only once it is an hour old. Until then, the
+				// placement check of the provider reports the removed region.
+				fakeClock.SetTime(claim.CreationTimestamp.Add(time.Minute))
+				Expect(driftReason()).To(Equal(string(MultiRegionPlacementDrift)))
+				// Then core finds no offering of the NodeClass in the region of the NodeClaim and reports
+				// InstanceTypeNotFound before it asks the provider.
+				fakeClock.SetTime(claim.CreationTimestamp.Add(2 * time.Hour))
+				Expect(driftReason()).To(Equal(string(nodeclaimdisruption.InstanceTypeNotFound)))
+			})
+			It("should report placement drift through the NodeClass drift checks", func() {
+				nodeClaim.Status.ProviderID = "azure:///subscriptions/synthetic/resourceGroups/synthetic/providers/Microsoft.Compute/virtualMachines/synthetic"
+				nodeClaim.Annotations = map[string]string{multiregion.PlacementAnnotation: string(lo.Must(json.Marshal(nodeClass.Spec.Regions[1])))}
+				nodeClass.Spec.Regions = nodeClass.Spec.Regions[:1]
+				drift, err := cloudProvider.isNodeClassDrifted(ctx, nodeClaim, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(drift).To(Equal(MultiRegionPlacementDrift))
+			})
+			DescribeTable("should drift only NodeClaims whose own placement is no longer listed",
+				func(annotated bool, edit func([]v1beta1.Region) []v1beta1.Region, expected corecloudprovider.DriftReason) {
+					delete(nodeClaim.Annotations, multiregion.PlacementAnnotation)
+					if annotated {
+						nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{multiregion.PlacementAnnotation: string(lo.Must(json.Marshal(nodeClass.Spec.Regions[1])))})
+					}
+					nodeClass.Spec.Regions = edit(slices.Clone(nodeClass.Spec.Regions))
+					drift, err := cloudProvider.isMultiRegionPlacementDrifted(ctx, nodeClaim, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(drift).To(Equal(expected))
+				},
+				Entry("unchanged", true, func(r []v1beta1.Region) []v1beta1.Region { return r }, NoDrift),
+				Entry("a region added", true, func(r []v1beta1.Region) []v1beta1.Region {
+					return append(r, v1beta1.Region{Name: "centralus", VNETSubnetID: r[0].VNETSubnetID + "-central"})
+				}, NoDrift),
+				Entry("regions reordered", true, func(r []v1beta1.Region) []v1beta1.Region { return []v1beta1.Region{r[1], r[0]} }, NoDrift),
+				Entry("another region removed", true, func(r []v1beta1.Region) []v1beta1.Region { return r[1:] }, NoDrift),
+				Entry("placement subnet recased", true, func(r []v1beta1.Region) []v1beta1.Region {
+					r[1].VNETSubnetID = strings.ToUpper(r[1].VNETSubnetID)
+					return r
+				}, NoDrift),
+				Entry("placement region removed", true, func(r []v1beta1.Region) []v1beta1.Region { return r[:1] }, MultiRegionPlacementDrift),
+				Entry("placement subnet changed", true, func(r []v1beta1.Region) []v1beta1.Region {
+					r[1].VNETSubnetID += "-new"
+					return r
+				}, MultiRegionPlacementDrift),
+				Entry("regions removed", true, func([]v1beta1.Region) []v1beta1.Region { return nil }, MultiRegionPlacementDrift),
+				Entry("regions added for a single-region NodeClaim", false, func(r []v1beta1.Region) []v1beta1.Region { return r }, MultiRegionPlacementDrift),
+			)
+			DescribeTable("should not report placement drift while the controller refuses spec.regions", func(enabled bool, mode, plugin, pluginMode string) {
+				testOptions.EnableMultiRegion, testOptions.ProvisionMode, testOptions.NetworkPlugin, testOptions.NetworkPluginMode = enabled, mode, plugin, pluginMode
+				// The NodeClaim has no placement, so it would drift if the controller accepted spec.regions.
+				delete(nodeClaim.Annotations, multiregion.PlacementAnnotation)
+				drift, err := cloudProvider.isMultiRegionPlacementDrifted(ctx, nodeClaim, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(drift).To(Equal(NoDrift))
+			},
+				Entry("multi-region provisioning disabled", false, consts.ProvisionModeAKSScriptless, consts.NetworkPluginNone, ""),
+				Entry("managed Azure CNI", true, consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay),
+				Entry("Machine API", true, consts.ProvisionModeAKSMachineAPI, consts.NetworkPluginNone, ""),
+			)
 			DescribeTable("should reject unsupported configurations even with a stale Ready condition", func(mode, plugin, pluginMode string) {
 				testOptions.ProvisionMode, testOptions.NetworkPlugin, testOptions.NetworkPluginMode = mode, plugin, pluginMode
 				ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)

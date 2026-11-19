@@ -18,3 +18,13 @@ package options
 
 // OverrideCoreOptions exposes startup registration to the external test suite.
 var OverrideCoreOptions = overrideCoreOptions
+
+// SetMultiRegionNodeIdentitiesJSON sets the raw --multi-region-node-identities value.
+func (o *Options) SetMultiRegionNodeIdentitiesJSON(raw string) {
+	o.multiRegionNodeIdentitiesJSON = raw
+}
+
+// ValidateMultiRegionOptions exposes the multi-region option validation to tests.
+func (o *Options) ValidateMultiRegionOptions() error {
+	return o.validateMultiRegionOptions()
+}

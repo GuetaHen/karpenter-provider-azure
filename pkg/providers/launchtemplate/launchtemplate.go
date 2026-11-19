@@ -158,6 +158,10 @@ func (p *Provider) getStaticParameters(
 		return nil, err
 	}
 	labels = lo.Assign(baseLabels, labels)
+	// MULTI_REGION_NODE_IDENTITIES can give this provider's region its own kubelet identity.
+	if id := options.FromContext(ctx).KubeletIdentityClientIDFor(p.location); id != options.FromContext(ctx).KubeletIdentityClientID {
+		labels[v1beta1.AKSLabelKubeletIdentityClientID] = id
+	}
 
 	// Remove labels kubelet can't set (e.g. kubernetes.io/*, k8s.io/* outside allowed namespaces)
 	labels = lo.OmitBy(labels, func(key string, _ string) bool {
@@ -193,7 +197,7 @@ func (p *Provider) getStaticParameters(
 		GPUDriverInstallationEnabled:   nodeClass.IsGPUDriverInstallationEnabled(),
 		TenantID:                       p.tenantID,
 		SubscriptionID:                 p.subscriptionID,
-		KubeletIdentityClientID:        p.kubeletIdentityClientID,
+		KubeletIdentityClientID:        p.regionKubeletIdentityClientID(ctx),
 		ResourceGroup:                  p.resourceGroup,
 		Location:                       p.location,
 		NetworkSecurityGroupName:       nsgName,
@@ -205,6 +209,15 @@ func (p *Provider) getStaticParameters(
 		SubnetID:                       subnetID,
 		ClusterResourceGroup:           p.clusterResourceGroup,
 	}, nil
+}
+
+// regionKubeletIdentityClientID returns the kubelet identity of this provider's nodes: the
+// MULTI_REGION_NODE_IDENTITIES entry for its region, if there is one, or the identity it was built with.
+func (p *Provider) regionKubeletIdentityClientID(ctx context.Context) string {
+	if id := options.FromContext(ctx).KubeletIdentityClientIDFor(p.location); id != options.FromContext(ctx).KubeletIdentityClientID {
+		return id
+	}
+	return p.kubeletIdentityClientID
 }
 
 func getAgentbakerNetworkPlugin(ctx context.Context) string {

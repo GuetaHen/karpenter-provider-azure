@@ -279,6 +279,29 @@ var _ = Describe("CloudProvider", func() {
 					Expect(err).ToNot(HaveOccurred())
 					Expect(drifted).To(Equal(KubeletIdentityDrift))
 				})
+
+				It("should expect the kubelet identity of the NodeClaim's region", func() {
+					regionClientID := "11111111-2222-3333-4444-555555555555"
+					node.Labels[v1beta1.AKSLabelKubeletIdentityClientID] = regionClientID
+					ExpectApplied(ctx, env.Client, node)
+					multiRegionOptions := test.Options(test.OptionsFields{KubeletIdentityClientID: lo.ToPtr("61f71907-753f-4802-a901-47361c3664f2")})
+					multiRegionOptions.EnableMultiRegion = true
+					multiRegionOptions.MultiRegionNodeIdentities = map[string]options.MultiRegionNodeIdentity{
+						"westus2": {
+							NodeIdentities:          []string{"/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/westus2"},
+							KubeletIdentityClientID: regionClientID,
+						},
+					}
+					multiRegionCtx := options.ToContext(ctx, multiRegionOptions)
+					driftNodeClaim.Labels[v1.LabelTopologyRegion] = "westus2"
+					drifted, err := cloudProvider.isKubeletIdentityDrifted(multiRegionCtx, driftNodeClaim, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(drifted).To(BeEmpty())
+					driftNodeClaim.Labels[v1.LabelTopologyRegion] = "eastus"
+					drifted, err = cloudProvider.isKubeletIdentityDrifted(multiRegionCtx, driftNodeClaim, nodeClass)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(drifted).To(Equal(KubeletIdentityDrift), "a NodeClaim outside the overridden regions expects the global kubelet identity")
+				})
 			})
 
 			Context("Static fields", func() {

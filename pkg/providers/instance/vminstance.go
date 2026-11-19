@@ -980,7 +980,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		Location:            p.location,
 		SSHPublicKey:        options.FromContext(ctx).SSHPublicKey,
 		LinuxAdminUsername:  options.FromContext(ctx).LinuxAdminUsername,
-		NodeIdentities:      options.FromContext(ctx).NodeIdentities,
+		NodeIdentities:      options.FromContext(ctx).NodeIdentitiesFor(p.location),
 		NodeClass:           nodeClass,
 		LaunchTemplate:      launchTemplate,
 		InstanceType:        instanceType,
