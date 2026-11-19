@@ -93,6 +93,53 @@ var _ = Describe("CEL/Validation", func() {
 			},
 		}
 	})
+	Context("Regions", func() {
+		DescribeTable("should validate region entries", func(regions []v1alpha2.Region, subnet *string, valid bool) {
+			nc := &v1alpha2.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec:       v1alpha2.AKSNodeClassSpec{Regions: regions, VNETSubnetID: subnet},
+			}
+			err := env.Client.Create(ctx, nc)
+			if valid {
+				Expect(err).ToNot(HaveOccurred())
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nc), nc)).To(Succeed())
+				Expect(nc.Spec.Regions).To(Equal(regions))
+			} else {
+				Expect(err).To(HaveOccurred())
+			}
+		},
+			Entry("two regions", []v1alpha2.Region{
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+				{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+			}, nil, true),
+			Entry("duplicate locations", []v1alpha2.Region{
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+			}, nil, false),
+			Entry("display name rather than location", []v1alpha2.Region{{Name: "East US 2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}}, nil, false),
+			Entry("invalid subnet", []v1alpha2.Region{{Name: "eastus2", VNETSubnetID: "not-an-arm-id"}}, nil, false),
+			Entry("conflicting subnet fields", []v1alpha2.Region{{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}},
+				lo.ToPtr("/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/default"), false),
+		)
+
+		It("should keep spec.regions when a NodeClass is updated through v1alpha2", func() {
+			regions := []v1beta1.Region{{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}}
+			stored := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec:       v1beta1.AKSNodeClassSpec{Regions: regions},
+			}
+			Expect(env.Client.Create(ctx, stored)).To(Succeed())
+
+			legacy := &v1alpha2.AKSNodeClass{}
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(stored), legacy)).To(Succeed())
+			legacy.Labels = map[string]string{"updated-through": "v1alpha2"}
+			Expect(env.Client.Update(ctx, legacy)).To(Succeed())
+
+			Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(stored), stored)).To(Succeed())
+			Expect(stored.Labels).To(HaveKeyWithValue("updated-through", "v1alpha2"))
+			Expect(stored.Spec.Regions).To(Equal(regions), "an update through a version without the field drops it")
+		})
+	})
 	Context("Kubelet overrides", func() {
 		DescribeTable("should validate kubeReserved", func(kubeReserved *v1alpha2.KubeReserved, expected bool) {
 			nodeClass := &v1alpha2.AKSNodeClass{
