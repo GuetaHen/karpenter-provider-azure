@@ -49,6 +49,7 @@ type OptionsFields struct {
 	EnableAzureSDKLogging          *bool
 	DiskEncryptionSetID            *string
 	EnableFIPS                     *bool
+	CommunityGalleryFIPSImages     *bool
 	ClusterDNSServiceIP            *string
 	ManageExistingAKSMachines      *bool
 	EnableMultiRegion              *bool
@@ -98,6 +99,7 @@ func Options(overrides ...OptionsFields) *azoptions.Options {
 		AdditionalTags:                 options.AdditionalTags,
 		DiskEncryptionSetID:            lo.FromPtrOr(options.DiskEncryptionSetID, ""),
 		EnableFIPS:                     lo.FromPtrOr(options.EnableFIPS, false),
+		CommunityGalleryFIPSImages:     lo.FromPtrOr(options.CommunityGalleryFIPSImages, false),
 		DNSServiceIP:                   lo.FromPtrOr(options.ClusterDNSServiceIP, ""),
 		ManageExistingAKSMachines:      lo.FromPtrOr(options.ManageExistingAKSMachines, false),
 		EnableMultiRegion:              lo.FromPtrOr(options.EnableMultiRegion, false),

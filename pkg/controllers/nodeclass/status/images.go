@@ -18,7 +18,9 @@ package status
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -118,10 +120,16 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 
 	// validate FIPS + useSIG
 	useSIG := options.FromContext(ctx).UseSIG
-	if nodeClass.IsFIPSEnabled() && !useSIG {
+	if nodeClass.IsFIPSEnabled() && !useSIG && !options.FromContext(ctx).CommunityGalleryFIPSImages {
 		nodeClass.Status.Images = nil
 		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, "SIGRequiredForFIPS", "FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)")
 		logger.Info("FIPS images require SIG", "error", fmt.Errorf("FIPS images require UseSIG to be enabled, but UseSIG is false (note: UseSIG is only supported in AKS managed NAP)"))
+		return reconcile.Result{}, nil
+	}
+	if nodeClass.IsFIPSEnabled() && !useSIG && !imagefamily.HasCommunityGalleryFIPSImages(nodeClass) {
+		nodeClass.Status.Images = nil
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, imagefamily.CommunityGalleryFIPSImagesUnavailableReason,
+			fmt.Sprintf("imageFamily %q publishes no usable FIPS node image in the public community gallery; use imageFamily %s, or UseSIG", lo.FromPtr(nodeClass.Spec.ImageFamily), v1beta1.AzureLinuxImageFamily))
 		return reconcile.Result{}, nil
 	}
 
@@ -135,11 +143,29 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	unpinning := reqImgVer == "" && nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).Reason == nodeImageVersionPinnedReason
 
 	latestImageVersion, err := r.nodeImageProvider.GetLatestVersion(ctx, nodeClass)
+	if notFound := new(imagefamily.FIPSImagesNotFoundError); stderrors.As(err, &notFound) {
+		// A region without a usable FIPS image is no error here: List reports it with its own condition below, so the
+		// latest version last observed stays.
+		latestImageVersion, err = "", nil
+		if observed := nodeClass.Status.ObservedVersions; observed != nil {
+			latestImageVersion = lo.FromPtr(observed.LatestImageVersion)
+		}
+	}
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("getting latest node image version, %w", err)
 	}
 
 	nodeImages, err := r.nodeImageProvider.List(ctx, nodeClass)
+	if notFound := new(imagefamily.FIPSImagesNotFoundError); stderrors.As(err, &notFound) {
+		// Launches stop until every region has a FIPS image. Ready images stay, so nodes do not drift and the
+		// maintenance window still governs their update (see imageVersionsUnready). The images of a pending
+		// update, such as a new NodeClass or a Kubernetes upgrade, are dropped so that the update completes.
+		if imageVersionsUnready(nodeClass) {
+			nodeClass.Status.Images = nil
+		}
+		nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeImagesReady, imagefamily.FIPSImagesNotFoundReason, notFound.Error())
+		return reconcile.Result{RequeueAfter: requeueTime}, nil
+	}
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("getting nodeimages, %w", err)
 	}
@@ -178,17 +204,32 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	// Note: We want to handle cases 1-3 regardless of maintenance window state, since they are either
 	// for initialization, based off an underlying customer operation, or a different update we're
 	// dependant upon which would have already been preformed within its required maintenance Window.
-	shouldUpdate := imageVersionsUnready(nodeClass) || pinningShouldUpdate || unpinning
+	pendingUpdate := imageVersionsUnready(nodeClass) || pinningShouldUpdate || unpinning
+	shouldUpdate := pendingUpdate
+	var windowErr error
 	if !shouldUpdate {
 		// Case 4: Check if the maintenance window is open
-		shouldUpdate, err = r.isMaintenanceWindowOpen(ctx)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("checking maintenance window, %w", err)
+		shouldUpdate, windowErr = r.isMaintenanceWindowOpen(ctx)
+	}
+	if windowErr != nil {
+		windowErr = fmt.Errorf("checking maintenance window, %w", windowErr)
+		if !keptImagesThroughFIPSImagesNotFound(nodeClass) {
+			return reconcile.Result{}, windowErr
 		}
+		// The FIPS images are listed again after an episode that kept the images in use. Keep their versions, as
+		// outside a maintenance window, instead of leaving the NodeClass not ready while the window is unknown.
+		logger.Error(windowErr, "keeping the node image versions in use while the maintenance window is unknown")
+		shouldUpdate = false
 	}
 	if !shouldUpdate {
 		// Scenario B: Calculate any partial update based on image selectors, or newly supports SKUs
 		goalImages = overrideAnyGoalStateVersionsWithExisting(nodeClass, goalImages)
+	}
+	if !pendingUpdate {
+		// A community gallery FIPS image definition that the listing skipped keeps its image until it is listed again.
+		if goalImages, err = keepSkippedFIPSImages(ctx, nodeClass, goalImages); err != nil {
+			return reconcile.Result{}, err
+		}
 	}
 
 	if len(goalImages) == 0 {
@@ -214,14 +255,68 @@ func (r *NodeImageReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.
 	} else {
 		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
 	}
-	return reconcile.Result{RequeueAfter: requeueTime}, nil
+	// A maintenance window that could not be determined while the images in use were kept is still reported.
+	return reconcile.Result{RequeueAfter: requeueTime}, windowErr
 }
 
 // Handles case 1: This is a new AKSNodeClass, where images haven't been populated yet
 // Handles case 2: This is indirectly handling k8s version image bump, since k8s version sets this status to false
 // Handles case 3: Note: like k8s we would also indirectly handle node features that required an image version bump, but none required atm.
+//
+// A NodeClass that kept its ready images while a region had no FIPS image (FIPSImagesNotFound) is not unready, so
+// that the maintenance window still governs their update once every region has one again.
 func imageVersionsUnready(nodeClass *v1beta1.AKSNodeClass) bool {
-	return !nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsTrue()
+	return !keptImagesThroughFIPSImagesNotFound(nodeClass) && !nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady).IsTrue()
+}
+
+// keptImagesThroughFIPSImagesNotFound reports a NodeClass that kept its ready images while a region had no FIPS
+// image (FIPSImagesNotFound).
+func keptImagesThroughFIPSImagesNotFound(nodeClass *v1beta1.AKSNodeClass) bool {
+	condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeImagesReady)
+	return condition.IsFalse() && condition.Reason == imagefamily.FIPSImagesNotFoundReason && len(nodeClass.Status.Images) > 0
+}
+
+// keepSkippedFIPSImages adds to goalImages the image in Status.Images of each community gallery FIPS image definition
+// that the NodeClass still selects but that the listing skipped in a region it listed, so that nodes on it keep their
+// image until the definition is listed again; the maintenance window then governs its update like any other. The image
+// of a definition that the NodeClass no longer selects, or of a region that the listing no longer covers, is not kept.
+// A kept image takes the place that the listing gives its definition among the images of its region, since the order
+// of Status.Images is the priority in which images are chosen for new nodes.
+func keepSkippedFIPSImages(ctx context.Context, nodeClass *v1beta1.AKSNodeClass, goalImages []v1beta1.NodeImage) ([]v1beta1.NodeImage, error) {
+	selected, err := imagefamily.CommunityGalleryFIPSImageBases(ctx, nodeClass)
+	if err != nil || len(selected) == 0 {
+		return goalImages, err
+	}
+	priority := func(image v1beta1.NodeImage) int { return lo.IndexOf(selected, trimVersionSuffix(image.ID)) }
+	listed, regions := map[string]bool{}, map[string]bool{}
+	for _, image := range goalImages {
+		listed[imageBaseKey(image)] = true
+		regions[imageRegions(image)] = true
+	}
+	for _, image := range nodeClass.Status.Images {
+		if listed[imageBaseKey(image)] || !regions[imageRegions(image)] || priority(image) < 0 {
+			continue
+		}
+		goalImages = slices.Insert(goalImages, priorityPosition(goalImages, image, priority), image)
+		listed[imageBaseKey(image)] = true
+	}
+	return goalImages, nil
+}
+
+// priorityPosition returns the index in images at which image keeps the priority order among the images of its region:
+// before the first of them that priority ranks after image, or else after the last of them.
+func priorityPosition(images []v1beta1.NodeImage, image v1beta1.NodeImage, priority func(v1beta1.NodeImage) int) int {
+	position := len(images)
+	for i := range images {
+		if imageRegions(images[i]) != imageRegions(image) {
+			continue
+		}
+		if priority(images[i]) > priority(image) {
+			return i
+		}
+		position = i + 1
+	}
+	return position
 }
 
 // Handles case 4: check if the maintenance window is open
@@ -328,17 +423,22 @@ func mapImageBasesToImages(images []v1beta1.NodeImage) map[string]*v1beta1.NodeI
 }
 
 func imageBaseKey(image v1beta1.NodeImage) string {
-	key := trimVersionSuffix(image.ID)
+	return trimVersionSuffix(image.ID) + imageRegions(image)
+}
+
+// imageRegions returns "|" and the sorted regions that an image is restricted to, or "" for an image without a
+// region requirement.
+func imageRegions(image v1beta1.NodeImage) string {
 	for _, requirement := range image.Requirements {
 		if requirement.Key == corev1.LabelTopologyRegion {
 			// The same gallery definition may be published at different versions
 			// in different regions, including while a maintenance window is closed.
 			regions := append([]string(nil), requirement.Values...)
 			sort.Strings(regions)
-			return key + "|" + strings.Join(regions, ",")
+			return "|" + strings.Join(regions, ",")
 		}
 	}
-	return key
+	return ""
 }
 
 // Trims off the version suffix, and leaves just the image base id

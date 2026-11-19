@@ -125,6 +125,10 @@ type Options struct {
 	DiskEncryptionSetID        string            `json:"diskEncryptionSetId,omitempty"`
 	EnableFIPS                 bool              `json:"enableFIPS,omitempty"`
 
+	// CommunityGalleryFIPSImages lets AKSNodeClasses with fipsMode FIPS and imageFamily AzureLinux
+	// resolve FIPS node images from the public community gallery when UseSIG is false.
+	CommunityGalleryFIPSImages bool `json:"communityGalleryFIPSImages,omitempty"`
+
 	// If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect if PROVISION_MODE is already an AKS Machine API mode, as it will behave as if this option is set to true.
 	ManageExistingAKSMachines bool `json:"manageExistingAKSMachines,omitempty"`
 
@@ -172,6 +176,7 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.StringVar(&o.SIGSubscriptionID, "sig-subscription-id", env.WithDefaultString("SIG_SUBSCRIPTION_ID", ""), "The subscription ID of the shared image gallery.")
 	fs.StringVar(&o.DiskEncryptionSetID, "node-osdisk-diskencryptionset-id", env.WithDefaultString("NODE_OSDISK_DISKENCRYPTIONSET_ID", ""), "The ARM resource ID of the disk encryption set to use for customer-managed key (BYOK) encryption.")
 	fs.BoolVar(&o.EnableFIPS, "enable-fips", env.WithDefaultBool("ENABLE_FIPS", false), "If set to true, AKSNodeClasses must explicitly enable FIPS mode. This setting mirrors the AKS cluster-level FIPS configuration.")
+	fs.BoolVar(&o.CommunityGalleryFIPSImages, "community-gallery-fips-images", env.WithDefaultBool("COMMUNITY_GALLERY_FIPS_IMAGES", false), "Experimental. If set to true and use-sig is false, AKSNodeClasses with fipsMode FIPS and imageFamily AzureLinux resolve FIPS node images from the public Azure Linux community gallery, separately in each region they place nodes in. When false, such AKSNodeClasses need use-sig. Other image families publish no usable FIPS image there and stay not ready. Has no effect when use-sig is true.")
 	fs.BoolVar(&o.ManageExistingAKSMachines, "manage-existing-aks-machines", env.WithDefaultBool("MANAGE_EXISTING_AKS_MACHINES", false), "If set to true, existing AKS machines created with an AKS Machine API provision mode will be managed even with other provision modes. This option does not have any effect when already on an AKS Machine API mode.")
 	fs.BoolVar(&o.EnableMultiRegion, "enable-multi-region", env.WithDefaultBool("ENABLE_MULTI_REGION", false), "Experimental. If set to true, AKSNodeClasses may set spec.regions to provision VMs in other Azure regions. When false, per-region providers are not constructed and NodeClasses that set spec.regions are not ready.")
 	fs.StringVar(&o.multiRegionNodeIdentitiesJSON, "multi-region-node-identities", env.WithDefaultString("MULTI_REGION_NODE_IDENTITIES", ""), "Experimental. Requires --enable-multi-region. A JSON object that maps a region name to an object with nodeIdentities (user-assigned identity resource IDs) and kubeletIdentityClientID, used for the VMs in that region instead of --node-identities and --kubelet-identity-client-id. An entry replaces both global values for its region; regions without an entry use the global values.")

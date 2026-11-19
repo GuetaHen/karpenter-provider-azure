@@ -167,6 +167,24 @@ var _ = Describe("Multi-region configuration", func() {
 	})
 })
 
+var _ = Describe("Community gallery FIPS images option", func() {
+	parse := func(args ...string) *options.Options {
+		fs := &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}
+		opts := &options.Options{}
+		opts.AddFlags(fs)
+		Expect(fs.Parse(args)).To(Succeed())
+		return opts
+	}
+
+	It("defaults to false and is set by its flag or COMMUNITY_GALLERY_FIPS_IMAGES", func() {
+		Expect(parse().CommunityGalleryFIPSImages).To(BeFalse())
+		Expect(parse("--community-gallery-fips-images").CommunityGalleryFIPSImages).To(BeTrue())
+		Expect(os.Setenv("COMMUNITY_GALLERY_FIPS_IMAGES", "true")).To(Succeed())
+		DeferCleanup(os.Unsetenv, "COMMUNITY_GALLERY_FIPS_IMAGES")
+		Expect(parse().CommunityGalleryFIPSImages).To(BeTrue())
+	})
+})
+
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
