@@ -51,6 +51,7 @@ type OptionsFields struct {
 	EnableFIPS                     *bool
 	ClusterDNSServiceIP            *string
 	ManageExistingAKSMachines      *bool
+	EnableMultiRegion              *bool
 	AKSMachinesPoolName            *string
 	ProviderBatchIdleDuration      *time.Duration
 	ProviderBatchMaxDuration       *time.Duration
@@ -99,6 +100,7 @@ func Options(overrides ...OptionsFields) *azoptions.Options {
 		EnableFIPS:                     lo.FromPtrOr(options.EnableFIPS, false),
 		DNSServiceIP:                   lo.FromPtrOr(options.ClusterDNSServiceIP, ""),
 		ManageExistingAKSMachines:      lo.FromPtrOr(options.ManageExistingAKSMachines, false),
+		EnableMultiRegion:              lo.FromPtrOr(options.EnableMultiRegion, false),
 		AKSMachinesPoolName:            lo.FromPtrOr(options.AKSMachinesPoolName, "aksmanagedap"),
 		ProviderBatchIdleDuration:      lo.FromPtrOr(options.ProviderBatchIdleDuration, time.Second),
 		ProviderBatchMaxDuration:       lo.FromPtrOr(options.ProviderBatchMaxDuration, 5*time.Second),

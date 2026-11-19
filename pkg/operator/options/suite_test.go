@@ -34,12 +34,87 @@ import (
 
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 )
 
 var ctx context.Context
+
+var _ = Describe("Multi-region configuration", func() {
+	It("rejects spec.regions unless the controller enables multi-region provisioning", func() {
+		opts := &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone}
+		nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu")}}
+		Expect(opts.ValidateRegions(nodeClass)).To(Succeed(), "NodeClasses without regions are unaffected")
+		nodeClass.Spec.Regions = []v1beta1.Region{{Name: "westus2", VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}}
+		Expect(opts.ValidateRegions(nodeClass)).To(MatchError(ContainSubstring("--enable-multi-region")))
+		opts.EnableMultiRegion = true
+		Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+	})
+	DescribeTable("rejects unsupported modes and networks without affecting unconfigured NodeClasses",
+		func(mode, plugin, pluginMode, dataplane string, supported bool) {
+			opts := &options.Options{ProvisionMode: mode, NetworkPlugin: plugin, NetworkPluginMode: pluginMode, NetworkDataplane: dataplane, EnableMultiRegion: true}
+			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu")}}
+			Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+			nodeClass.Spec.Regions = []v1beta1.Region{{
+				Name:         "westus2",
+				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+			}}
+			if supported {
+				Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+			} else {
+				Expect(opts.ValidateRegions(nodeClass)).ToNot(Succeed())
+			}
+		},
+		Entry("scriptless BYO CNI", consts.ProvisionModeAKSScriptless, consts.NetworkPluginNone, consts.NetworkPluginModeNone, consts.NetworkDataplaneNone, true),
+		Entry("Machine API", consts.ProvisionModeAKSMachineAPI, consts.NetworkPluginNone, consts.NetworkPluginModeNone, consts.NetworkDataplaneNone, false),
+		Entry("Machine API batch", consts.ProvisionModeAKSMachineAPIHeaderBatch, consts.NetworkPluginNone, consts.NetworkPluginModeNone, consts.NetworkDataplaneNone, false),
+		Entry("bootstrapping client", consts.ProvisionModeBootstrappingClient, consts.NetworkPluginNone, consts.NetworkPluginModeNone, consts.NetworkDataplaneNone, false),
+		Entry("Azure CNI Overlay", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay, consts.NetworkDataplaneAzure, false),
+		Entry("Azure CNI Overlay with Cilium", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay, consts.NetworkDataplaneCilium, false),
+		Entry("Azure CNI with pod IPs from the node subnet", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeNone, consts.NetworkDataplaneAzure, false),
+		Entry("Azure CNI with pod IPs from the node subnet and Cilium", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeNone, consts.NetworkDataplaneCilium, false),
+		Entry("contradictory BYO mode", consts.ProvisionModeAKSScriptless, consts.NetworkPluginNone, consts.NetworkPluginModeOverlay, consts.NetworkDataplaneNone, false),
+	)
+
+	It("accepts spec.regions only with a bring-your-own CNI", func() {
+		opts := &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginAzure, NetworkPluginMode: consts.NetworkPluginModeOverlay, EnableMultiRegion: true}
+		nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu"), Regions: []v1beta1.Region{{
+			Name:         "westus2",
+			VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+		}}}}
+		err := opts.ValidateRegions(nodeClass)
+		Expect(err).To(MatchError(ContainSubstring("networkPlugin=none")), "Azure CNI Overlay routes pod ranges only in the cluster VNet")
+		Expect(options.RegionsErrorReason(err)).To(Equal(options.ReasonMultiRegionUnsupportedConfiguration))
+		opts.NetworkPluginMode = consts.NetworkPluginModeNone
+		err = opts.ValidateRegions(nodeClass)
+		Expect(err).To(MatchError(ContainSubstring("networkPlugin=none")), "Azure CNI with pod IPs from the node subnet is not supported either")
+		Expect(options.RegionsErrorReason(err)).To(Equal(options.ReasonMultiRegionUnsupportedConfiguration))
+		opts.NetworkPlugin = consts.NetworkPluginNone
+		Expect(opts.ValidateRegions(nodeClass)).To(Succeed())
+		opts.EnableMultiRegion = false
+		err = opts.ValidateRegions(nodeClass)
+		Expect(err).To(MatchError(ContainSubstring("--enable-multi-region")))
+		Expect(options.RegionsErrorReason(err)).To(Equal(options.ReasonMultiRegionDisabled))
+	})
+
+	DescribeTable("reports a dedicated reason for provisioning modes that cannot launch nodes outside the cluster region",
+		func(mode string) {
+			opts := &options.Options{ProvisionMode: mode, NetworkPlugin: consts.NetworkPluginNone, EnableMultiRegion: true}
+			nodeClass := &v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{ImageFamily: lo.ToPtr("Ubuntu"), Regions: []v1beta1.Region{{
+				Name:         "westus2",
+				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+			}}}}
+			err := opts.ValidateRegions(nodeClass)
+			Expect(err).To(MatchError(ContainSubstring("provision mode " + mode + " ")))
+			Expect(options.RegionsErrorReason(err)).To(Equal(options.ReasonMultiRegionProvisionModeUnsupported))
+		},
+		Entry("bootstrappingclient", consts.ProvisionModeBootstrappingClient),
+		Entry("aksmachineapi", consts.ProvisionModeAKSMachineAPI),
+		Entry("aksmachineapiheaderbatch", consts.ProvisionModeAKSMachineAPIHeaderBatch),
+	)
+})
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -76,6 +151,7 @@ var _ = Describe("Options", func() {
 		"ENABLE_FIPS",
 		"AKS_MACHINES_POOL_NAME",
 		"MANAGE_EXISTING_AKS_MACHINES",
+		"ENABLE_MULTI_REGION",
 		"PROVIDER_BATCH_IDLE_DURATION",
 		"PROVIDER_BATCH_MAX_DURATION",
 		"PROVIDER_BATCH_MAX_SIZE",
@@ -202,6 +278,7 @@ var _ = Describe("Options", func() {
 			os.Setenv("ENABLE_FIPS", "true")
 			os.Setenv("AKS_MACHINES_POOL_NAME", "mpool")
 			os.Setenv("MANAGE_EXISTING_AKS_MACHINES", "true")
+			os.Setenv("ENABLE_MULTI_REGION", "true")
 			os.Setenv("PROVIDER_BATCH_IDLE_DURATION", "1500ms")
 			os.Setenv("PROVIDER_BATCH_MAX_DURATION", "6s")
 			os.Setenv("PROVIDER_BATCH_MAX_SIZE", "42")
@@ -237,6 +314,7 @@ var _ = Describe("Options", func() {
 				EnableFIPS:                     lo.ToPtr(true),
 				ClusterDNSServiceIP:            lo.ToPtr("10.244.0.1"),
 				ManageExistingAKSMachines:      lo.ToPtr(true),
+				EnableMultiRegion:              lo.ToPtr(true),
 				AKSMachinesPoolName:            lo.ToPtr("mpool"),
 				ProviderBatchIdleDuration:      lo.ToPtr(1500 * time.Millisecond),
 				ProviderBatchMaxDuration:       lo.ToPtr(6 * time.Second),
@@ -626,6 +704,7 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.ManageExistingAKSMachines).To(BeFalse())
+			Expect(opts.EnableMultiRegion).To(BeFalse(), "multi-region provisioning is opt-in")
 		})
 
 		It("should succeed with manage-existing-aks-machines set", func() {
@@ -937,6 +1016,7 @@ var _ = Describe("Options", func() {
 			)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(opts.ManageExistingAKSMachines).To(BeFalse())
+			Expect(opts.EnableMultiRegion).To(BeFalse(), "multi-region provisioning is opt-in")
 		})
 
 		It("should succeed with manage-existing-aks-machines set", func() {
