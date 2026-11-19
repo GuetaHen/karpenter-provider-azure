@@ -166,9 +166,13 @@ func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v
 	return reconcile.Result{RequeueAfter: ValidationSuccessRequeueInterval}, nil
 }
 
-func (r *StaticValidationReconciler) validateRegions(_ context.Context, nodeClass *v1beta1.AKSNodeClass) (validationResult, error) {
+func (r *StaticValidationReconciler) validateRegions(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (validationResult, error) {
+	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
+		return fail(options.RegionsErrorReason(err), err.Error()), nil
+	}
 	if len(nodeClass.Spec.Regions) > 0 {
-		return fail("MultiRegionUnsupportedConfiguration", "spec.regions is not supported yet"), nil
+		// Nothing launches the nodes of an AKSNodeClass in its regions yet.
+		return fail(options.ReasonMultiRegionUnsupportedConfiguration, "spec.regions is not supported yet"), nil
 	}
 	return pass(), nil
 }

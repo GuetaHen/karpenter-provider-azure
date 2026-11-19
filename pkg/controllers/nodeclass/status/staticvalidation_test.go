@@ -226,19 +226,70 @@ var _ = Describe("Validation Reconciler", func() {
 	})
 
 	Context("regions", func() {
-		It("should fail validation when spec.regions is set", func() {
+		var opts *options.Options
+		BeforeEach(func() {
+			opts = test.Options()
+			ctx = options.ToContext(context.Background(), opts)
+			nodeClass.Spec.VNETSubnetID = nil
 			nodeClass.Spec.Regions = []v1beta1.Region{{
 				Name:         "westus3",
 				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/nodes",
 			}}
-
+		})
+		// expectValidation reconciles and expects ValidationSucceeded to be true, or false with the reason.
+		expectValidation := func(reason string) {
+			GinkgoHelper()
 			_, err := reconciler.Reconcile(ctx, nodeClass)
 			Expect(err).ToNot(HaveOccurred())
-
 			condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded)
+			if reason == "" {
+				Expect(condition.IsTrue()).To(BeTrue(), condition.Message)
+				return
+			}
 			Expect(condition.IsTrue()).To(BeFalse())
-			Expect(condition.Reason).To(Equal("MultiRegionUnsupportedConfiguration"))
+			Expect(condition.Reason).To(Equal(reason))
+		}
+
+		It("should fail validation with a dedicated reason when multi-region provisioning is disabled", func() {
+			expectValidation(options.ReasonMultiRegionDisabled)
+			opts.EnableMultiRegion = false
+			expectValidation(options.ReasonMultiRegionDisabled)
 		})
+		// Until multi-region nodes can launch, a configuration that passes these checks is not supported yet.
+		expectNotSupportedYet := func() {
+			GinkgoHelper()
+			expectValidation(options.ReasonMultiRegionUnsupportedConfiguration)
+			Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded).Message).To(Equal("spec.regions is not supported yet"))
+		}
+		It("should pass the configuration checks with a bring-your-own CNI", func() {
+			opts.EnableMultiRegion = true
+			opts.NetworkPlugin, opts.NetworkPluginMode = consts.NetworkPluginNone, ""
+			expectNotSupportedYet()
+		})
+		DescribeTable("should refuse Azure CNI in every mode",
+			func(pluginMode, dataplane string) {
+				opts.EnableMultiRegion = true
+				opts.NetworkPlugin, opts.NetworkPluginMode, opts.NetworkDataplane = consts.NetworkPluginAzure, pluginMode, dataplane
+				expectValidation(options.ReasonMultiRegionUnsupportedConfiguration)
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded).Message).To(ContainSubstring("networkPlugin=none"))
+			},
+			Entry("Azure CNI Overlay", consts.NetworkPluginModeOverlay, consts.NetworkDataplaneAzure),
+			Entry("Azure CNI Overlay with Cilium", consts.NetworkPluginModeOverlay, consts.NetworkDataplaneCilium),
+			Entry("Azure CNI with pod IPs from the node subnet", consts.NetworkPluginModeNone, consts.NetworkDataplaneAzure),
+			Entry("Azure CNI with pod IPs from the node subnet and Cilium", consts.NetworkPluginModeNone, consts.NetworkDataplaneCilium),
+		)
+		DescribeTable("should refuse provisioning modes that cannot launch nodes outside the cluster region",
+			func(mode string) {
+				opts.EnableMultiRegion = true
+				opts.NetworkPlugin, opts.NetworkPluginMode = consts.NetworkPluginNone, ""
+				opts.ProvisionMode = mode
+				expectValidation(options.ReasonMultiRegionProvisionModeUnsupported)
+				Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded).Message).To(ContainSubstring("provision mode " + mode + " "))
+			},
+			Entry("bootstrappingclient", consts.ProvisionModeBootstrappingClient),
+			Entry("aksmachineapi", consts.ProvisionModeAKSMachineAPI),
+			Entry("aksmachineapiheaderbatch", consts.ProvisionModeAKSMachineAPIHeaderBatch),
+		)
 	})
 
 	Context("image family Kubernetes version compatibility", func() {
