@@ -19,12 +19,19 @@ package cloudprovider
 // TODO v1beta1 extra refactor into suite_test.go / cloudprovider_test.go
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	. "github.com/Azure/karpenter-provider-azure/pkg/test/expectations"
 	"github.com/Azure/skewer"
 	"github.com/awslabs/operatorpkg/object"
@@ -50,6 +57,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/state/virtualpods"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
@@ -58,11 +66,15 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/auth"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclaim/garbagecollection"
 	"github.com/Azure/karpenter-provider-azure/pkg/controllers/nodeclass/status"
 	"github.com/Azure/karpenter-provider-azure/pkg/fake"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/multiregion"
 	"github.com/Azure/karpenter-provider-azure/pkg/test"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils/zones"
 	corestatus "github.com/awslabs/operatorpkg/status"
@@ -466,6 +478,433 @@ var _ = Describe("CloudProvider", func() {
 		runCapacityBufferTests(func(expectedCalls int) {
 			Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(expectedCalls))
 			Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(0))
+		})
+
+		Context("Multi-region disabled", func() {
+			It("should report MultiRegionDisabled and refuse an AKSNodeClass with spec.regions without per-region or network calls", func() {
+				Expect(testOptions.EnableMultiRegion).To(BeFalse(), "multi-region provisioning is off by default")
+				subnetCalls := 0
+				azureEnv.SubnetsAPI.GetFunc = func(context.Context, string, string, string, *armnetwork.SubnetsClientGetOptions) (armnetwork.SubnetsClientGetResponse, error) {
+					subnetCalls++
+					return armnetwork.SubnetsClientGetResponse{}, nil
+				}
+				DeferCleanup(azureEnv.SubnetsAPI.Reset)
+				nodeClass.Spec.VNETSubnetID = nil
+				nodeClass.Spec.Regions = []v1beta1.Region{{Name: fake.RegionNonZonal, VNETSubnetID: fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes", azureEnv.SubscriptionID)}}
+				// Wired as the operator wires them with the option off: home-region providers and no multi-region subnet validator.
+				controller := status.NewController(env.Client, azureEnv.SubscriptionID, fake.Region, azureEnv.KubernetesVersionProvider, azureEnv.ImageProvider, env.KubernetesInterface, env.KubernetesInterface, azureEnv.DynamicInterface, azureEnv.SubnetsAPI, azureEnv.DiskEncryptionSetsAPI, testOptions.ParsedDiskEncryptionSetID, options.FromContext(ctx).NetworkPolicy, options.FromContext(ctx).NetworkPlugin,
+					azureEnv.CapacityReservationGroupsAPI, azureEnv.CapacityReservationsAPI, azureEnv.InstanceTypesProvider, azureEnv.UnavailableOfferingsCache, testOptions.SystemNamespace, nil)
+				ExpectApplied(ctx, env.Client, nodePool, nodeClass, nodeClaim)
+				Expect(func() { ExpectObjectReconciled(ctx, env.Client, controller, nodeClass) }).ToNot(Panic())
+				nodeClass = ExpectExists(ctx, env.Client, nodeClass)
+				for _, conditionType := range []string{v1beta1.ConditionTypeValidationSucceeded, v1beta1.ConditionTypeSubnetsReady} {
+					condition := nodeClass.StatusConditions().Get(conditionType)
+					Expect(condition.IsFalse()).To(BeTrue(), conditionType)
+					Expect(condition.Reason).To(Equal(options.ReasonMultiRegionDisabled), conditionType)
+				}
+				var err error
+				Expect(func() { _, err = cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim)) }).ToNot(Panic())
+				Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+				Expect(subnetCalls).To(BeZero())
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+			})
+		})
+
+		Context("Multi-region", func() {
+			var remote *test.Environment
+			var registry *multiregion.Registry
+			// regionErrs fails the subnet check of a region.
+			var regionErrs map[string]error
+			BeforeEach(func() {
+				regionErrs = map[string]error{}
+				testOptions.NetworkPlugin = consts.NetworkPluginNone
+				testOptions.NetworkPluginMode = ""
+				testOptions.ComputeRecommendationMode = consts.ComputeRecommendationModeDisabled
+				testOptions.EnableMultiRegion = true
+				remote = test.NewRegionalEnvironment(ctx, env, fake.RegionNonZonal, true)
+				remoteVMs := instance.NewDefaultVMProvider(azureEnv.AZClient,
+					remote.InstanceTypesProvider, remote.AllocationStrategyProvider, remote.LaunchTemplateProvider,
+					azureEnv.LoadBalancerProvider, azureEnv.NetworkSecurityGroupProvider, remote.UnavailableOfferingsCache,
+					fake.RegionNonZonal, testOptions.NodeResourceGroup, azureEnv.SubscriptionID, testOptions.ProvisionMode, "",
+					lo.Must(auth.EnvironmentFromName("AzurePublicCloud")), remote.QuotaProvider)
+				registry = multiregion.New(fake.Region, &multiregion.Providers{
+					Types: azureEnv.InstanceTypesProvider, Images: azureEnv.ImageProvider, Instances: azureEnv.VMInstanceProvider, Quota: azureEnv.QuotaProvider,
+				}, func(region string) *multiregion.Providers {
+					Expect(region).To(Equal(fake.RegionNonZonal))
+					return &multiregion.Providers{Types: remote.InstanceTypesProvider, Images: remote.ImageProvider, Instances: remoteVMs, Quota: remote.QuotaProvider}
+				}, func(_ context.Context, region v1beta1.Region) error {
+					Expect(region.Name).To(BeElementOf(fake.Region, fake.RegionNonZonal))
+					return regionErrs[region.Name]
+				}).WithClock(fakeClock)
+				multiRegionTypes := &multiregion.InstanceTypes{Provider: azureEnv.InstanceTypesProvider, Registry: registry}
+				multiRegionImages := &multiregion.Images{NodeImageProvider: azureEnv.ImageProvider, Registry: registry}
+				multiRegionVMs := &multiregion.Instances{VMProvider: azureEnv.VMInstanceProvider, Registry: registry, KubeClient: env.Client}
+				cloudProvider = New(multiRegionTypes, multiRegionVMs, azureEnv.AKSMachineProvider, recorder, env.Client, multiRegionImages, azureEnv.InstanceTypeStore, false)
+				cluster = state.NewCluster(fakeClock, env.Client, cloudProvider)
+				coreProvisioner = provisioning.NewProvisioner(env.Client, recorder, cloudProvider, cluster, fakeClock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+				nodeClass.Spec.VNETSubnetID = nil
+				nodeClass.Spec.Regions = []v1beta1.Region{
+					{Name: fake.Region, VNETSubnetID: fmt.Sprintf("/subscriptions/%s/resourceGroups/network-home/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes", azureEnv.SubscriptionID)},
+					{Name: fake.RegionNonZonal, VNETSubnetID: fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes", azureEnv.SubscriptionID)},
+				}
+				images, err := multiRegionImages.List(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				nodeClass.Status.Images = lo.Map(images, func(image imagefamily.NodeImage, _ int) v1beta1.NodeImage {
+					return v1beta1.NodeImage{ID: image.ID, Requirements: lo.Map(image.Requirements.NodeSelectorRequirements(), func(r karpv1.NodeSelectorRequirementWithMinValues, _ int) v1.NodeSelectorRequirement {
+						return v1.NodeSelectorRequirement{Key: r.Key, Operator: r.Operator, Values: r.Values}
+					})}
+				})
+			})
+			AfterEach(func() {
+				cloudProvider.WaitForInstancePromises()
+				remote.Reset(ctx)
+			})
+			It("should isolate quota and capacity failures for regional zone zero", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				sku := fake.MakeSKU("Standard_D2_v3")
+				remote.UsageAPI.Usages.Append(&armcompute.Usage{
+					Name:         &armcompute.UsageName{Value: lo.ToPtr(sku.GetFamilyName())},
+					CurrentValue: lo.ToPtr(int32(10)), Limit: lo.ToPtr[int64](10),
+				})
+				Expect(remote.QuotaProvider.Update(ctx)).To(Succeed())
+				remote.UnavailableOfferingsCache.MarkUnavailable(ctx, "AllocationFailed", sku, zones.Regional, karpv1.CapacityTypeSpot)
+				types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).ToNot(HaveOccurred())
+				instanceType, ok := lo.Find(types, func(i *corecloudprovider.InstanceType) bool { return i.Name == sku.GetName() })
+				Expect(ok).To(BeTrue())
+				for _, offering := range instanceType.Offerings {
+					if offering.Requirements.Get(v1.LabelTopologyZone).Has(zones.Regional) {
+						Expect(offering.Available).To(Equal(offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.Region)))
+					}
+				}
+				Expect(azureEnv.QuotaProvider.HasQuotaFor(ctx, sku)).To(BeTrue())
+				Expect(azureEnv.UnavailableOfferingsCache.IsUnavailable(sku, zones.Regional, karpv1.CapacityTypeSpot)).To(BeFalse())
+			})
+			It("should delete the NIC of a VM that fails to create in another region and retry there", func() {
+				nodeClaim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{
+					{Key: v1.LabelTopologyRegion, Operator: v1.NodeSelectorOpIn, Values: []string{fake.RegionNonZonal}},
+					{Key: v1.LabelInstanceTypeStable, Operator: v1.NodeSelectorOpIn, Values: []string{"Standard_D2_v3"}},
+					{Key: karpv1.CapacityTypeLabelKey, Operator: v1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeOnDemand}},
+				}
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+				azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.BeginError.Set(&azcore.ResponseError{ErrorCode: "InternalOperationError"})
+				created, err := cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+				Expect(err).To(HaveOccurred())
+				Expect(created).To(BeNil())
+				// The NIC was created in the subnet of the other region and deleted with the failed VM.
+				Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(1))
+				nic := azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Pop()
+				Expect(lo.FromPtr(nic.Interface.Location)).To(Equal(fake.RegionNonZonal))
+				_, found := azureEnv.NetworkInterfacesAPI.NetworkInterfaces.Load(lo.FromPtr(nic.Interface.ID))
+				Expect(found).To(BeFalse())
+				// The placement recorded before the first Azure write stays, so the retry launches in the same region.
+				placement := ExpectExists(ctx, env.Client, nodeClaim).Annotations[multiregion.PlacementAnnotation]
+				Expect(placement).To(ContainSubstring(fake.RegionNonZonal))
+
+				azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.BeginError.Set(nil)
+				created, err = CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, ExpectExists(ctx, env.Client, nodeClaim))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(created.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.RegionNonZonal))
+				Expect(created.Annotations).To(HaveKeyWithValue(multiregion.PlacementAnnotation, placement))
+			})
+			It("should schedule one NodePool in two physical regions and preserve retry, discovery and deletion", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pods := []*v1.Pod{
+					coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.Region, v1.LabelInstanceTypeStable: "Standard_D2_v3"}}),
+					coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}}),
+				}
+				results := ExpectProvisionedResults(ctx, env.Client, cluster, cloudProvider, coreProvisioner, pods...)
+				Expect(results.NewNodeClaims).To(HaveLen(2))
+				scheduled := ExpectScheduledNodeClaimsCreated(ctx, env.Client, coreProvisioner, results.NewNodeClaims...)
+				for i, claim := range scheduled {
+					deployed, node, err := ExpectNodeClaimDeployed(ctx, env.Client, cloudProvider, claim)
+					Expect(err).ToNot(HaveOccurred())
+					cluster.UpdateNodeClaim(deployed)
+					Expect(cluster.UpdateNode(ctx, node)).To(Succeed())
+					cloudProvider.WaitForInstancePromises()
+					BindPodsToNode(ctx, env.Client, cluster, results.NewNodeClaims[i], node)
+				}
+				for _, pod := range pods {
+					ExpectScheduled(ctx, env.Client, pod)
+				}
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2))
+				claims, err := cloudProvider.List(ctx)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(claims).To(HaveLen(2))
+				Expect(lo.Map(claims, func(c *karpv1.NodeClaim, _ int) string { return c.Labels[v1.LabelTopologyRegion] })).To(ConsistOf(fake.Region, fake.RegionNonZonal))
+				for _, created := range claims {
+					actual, err := cloudProvider.Get(ctx, created.Status.ProviderID)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(actual.Labels[v1.LabelTopologyRegion]).To(Equal(created.Labels[v1.LabelTopologyRegion]))
+					claim := ExpectExists(ctx, env.Client, &karpv1.NodeClaim{ObjectMeta: metav1.ObjectMeta{Name: created.Name}})
+					Expect(claim.Annotations[multiregion.PlacementAnnotation]).To(ContainSubstring(created.Labels[v1.LabelTopologyRegion]))
+					retried, err := CreateAndWaitForPromises(ctx, cloudProvider, azureEnv, claim)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(retried.Status.ProviderID).To(Equal(created.Status.ProviderID))
+					vmName := instance.GenerateResourceName(created.Name)
+					nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, vmName, nil)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(lo.FromPtr(nic.Location)).To(Equal(created.Labels[v1.LabelTopologyRegion]))
+					Expect(nic.Properties.NetworkSecurityGroup).To(BeNil(), "NSGs of other regions belong to the subnet, not the home-region NIC")
+					Expect(lo.FromPtr(nic.Properties.EnableIPForwarding)).To(BeFalse(), "NICs in other regions keep IP forwarding off, as other Karpenter NICs do")
+					for _, config := range nic.Properties.IPConfigurations {
+						Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
+						target, found := lo.Find(nodeClass.Spec.Regions, func(r v1beta1.Region) bool { return r.Name == created.Labels[v1.LabelTopologyRegion] })
+						Expect(found).To(BeTrue())
+						Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(target.VNETSubnetID))
+					}
+					Expect(cloudProvider.Delete(ctx, created)).To(Succeed())
+				}
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2), "retries must adopt the original VM")
+				Expect(azureEnv.LoadBalancersAPI.NewListPagerBehavior.CalledWithInput.Len()).To(BeZero())
+			})
+			It("should exclude multi-region nodes from load balancers and place their NICs in the subnet of their region", func() {
+				regionSubnetID := fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/remote-vnet/subnets/remote-nodes", azureEnv.SubscriptionID)
+				nodeClass.Spec.Regions[1].VNETSubnetID = regionSubnetID
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				Expect(lo.FromPtr(input.VM.Location)).To(Equal(fake.RegionNonZonal))
+				customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(input.VM.Properties.OSProfile.CustomData))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(customData)).To(ContainSubstring(v1.LabelNodeExcludeBalancers + "=true"))
+				nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(nic.Properties.NetworkSecurityGroup).To(BeNil())
+				Expect(lo.FromPtr(nic.Properties.EnableIPForwarding)).To(BeFalse())
+				for _, config := range nic.Properties.IPConfigurations {
+					Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
+					Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(regionSubnetID))
+				}
+			})
+			It("should keep a hydrated region when its refresh fails and fail stale quota open", func() {
+				start := fakeClock.Now()
+				DeferCleanup(func() { fakeClock.SetTime(start) })
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				sku := fake.MakeSKU("Standard_D2_v3")
+				remote.UsageAPI.Usages.Append(&armcompute.Usage{
+					Name:         &armcompute.UsageName{Value: lo.ToPtr(sku.GetFamilyName())},
+					CurrentValue: lo.ToPtr(int32(10)), Limit: lo.ToPtr[int64](10),
+				})
+				// Core drift requires an offering compatible with a launched NodeClaim's labels.
+				claimLabels := scheduling.NewLabelRequirements(map[string]string{
+					v1.LabelTopologyRegion: fake.RegionNonZonal, karpv1.CapacityTypeLabelKey: karpv1.CapacityTypeOnDemand,
+				})
+				remoteOfferings := func() corecloudprovider.Offerings {
+					types, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+					Expect(err).ToNot(HaveOccurred())
+					instanceType, ok := lo.Find(types, func(i *corecloudprovider.InstanceType) bool { return i.Name == sku.GetName() })
+					Expect(ok).To(BeTrue())
+					offerings := instanceType.Offerings.Compatible(claimLabels)
+					Expect(offerings).ToNot(BeEmpty(), "a failed refresh must not make core drift report InstanceTypeNotFound")
+					return offerings
+				}
+				Expect(remoteOfferings().Available()).To(BeEmpty(), "fresh quota is enforced")
+				remote.SKUsAPI.Error = errors.New("synthetic SKU outage")
+				remote.UsageAPI.Error = errors.New("synthetic quota outage")
+				fakeClock.Step(13 * time.Hour)
+				Expect(remoteOfferings().Available()).ToNot(BeEmpty(), "stale quota fails open like the home region")
+			})
+			It("should fail the NodeClass instead of serving a partial catalog when a region never loaded", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				remote.SKUsAPI.Error = errors.New("synthetic SKU outage")
+				_, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal + " has no SKU catalog yet")))
+			})
+			It("should fail the NodeClass while a never-loaded region with a NodeClaim also fails its subnet check", func() {
+				registry.WithKubeClient(env.Client)
+				remote.SKUsAPI.Error = errors.New("synthetic SKU outage")
+				regionErrs[fake.RegionNonZonal] = errors.New("synthetic subnet outage")
+				placed := coretest.NodeClaim(karpv1.NodeClaim{
+					ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+						multiregion.PlacementAnnotation: string(lo.Must(json.Marshal(nodeClass.Spec.Regions[1]))),
+					}},
+					Spec: karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{
+						Group: object.GVK(nodeClass).Group, Kind: object.GVK(nodeClass).Kind, Name: nodeClass.Name,
+					}},
+				})
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, placed)
+				notLoaded := ContainSubstring("region " + fake.RegionNonZonal + " has no SKU catalog yet")
+				err := registry.ValidateSubnets(ctx, nodeClass)
+				Expect(err).To(MatchError(notLoaded), "the SKU catalog is checked before the subnet")
+				var partial interface{ UnavailableRegions() []string }
+				Expect(errors.As(err, &partial)).To(BeFalse(), "SubnetsReady turns False, so the NodeClass is not ready")
+				_, err = cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).To(MatchError(notLoaded), "no partial catalog in which core drift would miss the NodeClaim's instance type")
+			})
+			It("should keep provisioning in the other regions while a region without NodeClaims fails its checks", func() {
+				registry.WithKubeClient(env.Client)
+				regionErrs[fake.RegionNonZonal] = errors.New("synthetic subnet outage")
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				err := registry.ValidateSubnets(ctx, nodeClass)
+				Expect(err).To(MatchError(ContainSubstring("region " + fake.RegionNonZonal + " subnet: synthetic subnet outage")))
+				var partial interface{ UnavailableRegions() []string }
+				Expect(errors.As(err, &partial)).To(BeTrue())
+				Expect(partial.UnavailableRegions()).To(ConsistOf(fake.RegionNonZonal))
+				instanceTypes, err := cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).ToNot(HaveOccurred())
+				remoteOfferings := 0
+				for _, instanceType := range instanceTypes {
+					for _, offering := range instanceType.Offerings {
+						if offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.RegionNonZonal) {
+							remoteOfferings++
+							Expect(offering.Available).To(BeFalse(), "%s in the failing region", instanceType.Name)
+						}
+					}
+				}
+				Expect(remoteOfferings).ToNot(BeZero(), "the failing region keeps its instance types for core drift")
+				pod := coretest.UnschedulablePod()
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.Region))
+
+				delete(regionErrs, fake.RegionNonZonal)
+				Expect(registry.ValidateSubnets(ctx, nodeClass)).To(Succeed())
+				instanceTypes, err = cloudProvider.GetInstanceTypes(ctx, nodePool)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(lo.ContainsBy(instanceTypes, func(instanceType *corecloudprovider.InstanceType) bool {
+					return lo.ContainsBy(instanceType.Offerings.Available(), func(offering *corecloudprovider.Offering) bool {
+						return offering.Requirements.Get(v1.LabelTopologyRegion).Has(fake.RegionNonZonal)
+					})
+				})).To(BeTrue(), "the region serves again once it passes")
+			})
+			It("should garbage collect the VM of a removed region", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				Expect(lo.FromPtr(input.VM.Location)).To(Equal(fake.RegionNonZonal))
+				// The region leaves the NodeClass, and its NodeClaim is gone while its VM is past the grace period.
+				nodeClass.Spec.Regions = nodeClass.Spec.Regions[:1]
+				ExpectApplied(ctx, env.Client, nodeClass)
+				nodeClaims := &karpv1.NodeClaimList{}
+				Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+				Expect(nodeClaims.Items).To(HaveLen(1))
+				ExpectFinalizersRemoved(ctx, env.Client, &nodeClaims.Items[0])
+				ExpectDeleted(ctx, env.Client, &nodeClaims.Items[0])
+				stored, err := azureEnv.VirtualMachinesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				vm := stored.VirtualMachine
+				vm.Properties.TimeCreated = lo.ToPtr(time.Now().Add(-10 * time.Minute))
+				azureEnv.VirtualMachinesAPI.Instances.Store(lo.FromPtr(vm.ID), vm)
+				ExpectSingletonReconciled(ctx, garbagecollection.NewInstance(env.Client, cloudProvider, fakeClock))
+				_, found := azureEnv.VirtualMachinesAPI.Instances.Load(lo.FromPtr(vm.ID))
+				Expect(found).To(BeFalse(), "the VM of the removed region is deleted")
+			})
+			It("should label a VM with its location only while multi-region provisioning is enabled", func() {
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+				ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+				ExpectScheduled(ctx, env.Client, pod)
+				input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+				vm, err := azureEnv.VirtualMachinesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+				Expect(err).ToNot(HaveOccurred())
+				// The home-region catalog offers the instance type only in the home region.
+				homeTypes, err := azureEnv.InstanceTypesProvider.List(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				homeType, found := lo.Find(homeTypes, func(it *corecloudprovider.InstanceType) bool { return it.Name == "Standard_D2_v3" })
+				Expect(found).To(BeTrue())
+				labeled, err := cloudProvider.vmInstanceToNodeClaim(ctx, &vm.VirtualMachine, homeType)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(labeled.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.RegionNonZonal))
+				testOptions.EnableMultiRegion = false
+				labeled, err = cloudProvider.vmInstanceToNodeClaim(ctx, &vm.VirtualMachine, homeType)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(labeled.Labels).To(HaveKeyWithValue(v1.LabelTopologyRegion, fake.Region), "without multi-region provisioning the instance type gives the label, as before the feature existed")
+			})
+			It("should reject spec.regions before any Azure write when multi-region provisioning is disabled", func() {
+				testOptions.EnableMultiRegion = false
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+				_, err := cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+				Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+			})
+			DescribeTable("should refuse spec.regions on Azure CNI before any Azure write",
+				func(pluginMode, dataplane string) {
+					testOptions.NetworkPlugin, testOptions.NetworkPluginMode, testOptions.NetworkDataplane = consts.NetworkPluginAzure, pluginMode, dataplane
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+					_, err := cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+					Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+					Expect(err).To(MatchError(ContainSubstring("networkPlugin=none")))
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+					Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				},
+				Entry("Azure CNI Overlay", consts.NetworkPluginModeOverlay, consts.NetworkDataplaneAzure),
+				Entry("Azure CNI Overlay with Cilium", consts.NetworkPluginModeOverlay, consts.NetworkDataplaneCilium),
+				Entry("Azure CNI with pod IPs from the node subnet", consts.NetworkPluginModeNone, consts.NetworkDataplaneAzure),
+				Entry("Azure CNI with pod IPs from the node subnet and Cilium", consts.NetworkPluginModeNone, consts.NetworkDataplaneCilium),
+			)
+			DescribeTable("should refuse spec.regions in provisioning modes that cannot launch nodes outside the cluster region before any Azure write",
+				func(mode string) {
+					testOptions.ProvisionMode = mode
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+					_, err := cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+					Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+					Expect(err).To(MatchError(ContainSubstring("provision mode " + mode + " ")))
+					Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+					Expect(azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+					Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				},
+				Entry("bootstrappingclient", consts.ProvisionModeBootstrappingClient),
+				Entry("aksmachineapi", consts.ProvisionModeAKSMachineAPI),
+				Entry("aksmachineapiheaderbatch", consts.ProvisionModeAKSMachineAPIHeaderBatch),
+			)
+			It("should send identical VM, NIC and bootstrap requests for an AKSNodeClass without spec.regions with multi-region provisioning on or off", func() {
+				nodeClass.Spec.Regions = nil
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+				// Each pod takes most of a Standard_D2_v3, so each launch needs a node of its own.
+				launch := func(cp *CloudProvider, provisioner *provisioning.Provisioner) string {
+					GinkgoHelper()
+					pod := coretest.UnschedulablePod(coretest.PodOptions{
+						NodeSelector:         map[string]string{v1.LabelInstanceTypeStable: "Standard_D2_v3", v1.LabelTopologyZone: fakeZone1},
+						ResourceRequirements: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1500m")}},
+					})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cp, provisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+					nic := azureEnv.NetworkInterfacesAPI.NetworkInterfacesCreateOrUpdateBehavior.CalledWithInput.Pop()
+					customData := lo.Must(base64.StdEncoding.DecodeString(lo.FromPtr(input.VM.Properties.OSProfile.CustomData)))
+					osProfile := *input.VM.Properties.OSProfile
+					osProfile.CustomData = nil
+					properties := *input.VM.Properties
+					properties.OSProfile = &osProfile
+					vm := input.VM
+					vm.Properties = &properties
+					// The names of the NodeClaim, the VM and the NIC differ between launches.
+					names := strings.NewReplacer(input.VMName, "<vm>", strings.TrimPrefix(input.VMName, "aks-"), "<nodeclaim>")
+					// The kubelet flags and node labels in the bootstrap data can list the entries of a map, such
+					// as those of --eviction-hard, in any order, so it is compared as the sorted list of its words.
+					words := strings.FieldsFunc(names.Replace(string(customData)), func(r rune) bool {
+						return !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("./-_:", r)
+					})
+					slices.Sort(words)
+					return names.Replace(string(lo.Must(json.Marshal([]any{vm, nic.Interface, words}))))
+				}
+				enabled := launch(cloudProvider, coreProvisioner)
+				Expect(enabled).To(ContainSubstring(`"enableIPForwarding":false`), "an AKSNodeClass without spec.regions keeps IP forwarding off")
+				testOptions.EnableMultiRegion = false
+				plain := New(azureEnv.InstanceTypesProvider, azureEnv.VMInstanceProvider, azureEnv.AKSMachineProvider, recorder, env.Client, azureEnv.ImageProvider, azureEnv.InstanceTypeStore, false)
+				plainProvisioner := provisioning.NewProvisioner(env.Client, recorder, plain, cluster, fakeClock, deviceallocation.NewController(env.Client), virtualpods.NewVirtualPodCache(env.Client))
+				Expect(launch(plain, plainProvisioner)).To(Equal(enabled))
+			})
+			DescribeTable("should reject unsupported configurations even with a stale Ready condition", func(mode, plugin, pluginMode string) {
+				testOptions.ProvisionMode, testOptions.NetworkPlugin, testOptions.NetworkPluginMode = mode, plugin, pluginMode
+				ExpectApplied(ctx, env.Client, nodeClass, nodePool, nodeClaim)
+				_, err := cloudProvider.Create(ctx, ExpectExists(ctx, env.Client, nodeClaim))
+				Expect(corecloudprovider.IsNodeClassNotReadyError(err)).To(BeTrue())
+				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+				Expect(azureEnv.AKSMachinesAPI.AKSMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+			},
+				Entry("managed Azure CNI", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay),
+				Entry("managed Azure CNI with pod IPs from the node subnet", consts.ProvisionModeAKSScriptless, consts.NetworkPluginAzure, consts.NetworkPluginModeNone),
+				Entry("Machine API", consts.ProvisionModeAKSMachineAPI, consts.NetworkPluginNone, ""),
+				Entry("Machine API header batch", consts.ProvisionModeAKSMachineAPIHeaderBatch, consts.NetworkPluginNone, ""),
+			)
 		})
 
 		It("should reject managed GPU before creating a VM on an unsupported provision mode", func() {

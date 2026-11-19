@@ -255,16 +255,10 @@ var _ = Describe("Validation Reconciler", func() {
 			opts.EnableMultiRegion = false
 			expectValidation(options.ReasonMultiRegionDisabled)
 		})
-		// Until multi-region nodes can launch, a configuration that passes these checks is not supported yet.
-		expectNotSupportedYet := func() {
-			GinkgoHelper()
-			expectValidation(options.ReasonMultiRegionUnsupportedConfiguration)
-			Expect(nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded).Message).To(Equal("spec.regions is not supported yet"))
-		}
-		It("should pass the configuration checks with a bring-your-own CNI", func() {
+		It("should pass validation with a bring-your-own CNI", func() {
 			opts.EnableMultiRegion = true
 			opts.NetworkPlugin, opts.NetworkPluginMode = consts.NetworkPluginNone, ""
-			expectNotSupportedYet()
+			expectValidation("")
 		})
 		DescribeTable("should refuse Azure CNI in every mode",
 			func(pluginMode, dataplane string) {
