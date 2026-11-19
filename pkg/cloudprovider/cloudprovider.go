@@ -20,6 +20,7 @@ import (
 	"context"
 	stderrors "errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -119,6 +120,9 @@ func (c *CloudProvider) WaitForInstancePromises() {
 }
 
 func (c *CloudProvider) validateNodeClass(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) error {
+	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
+		return cloudprovider.NewNodeClassNotReadyError(err)
+	}
 	if options.FromContext(ctx).EnableFIPS && lo.FromPtr(nodeClass.Spec.FIPSMode) != v1beta1.FIPSModeFIPS {
 		return cloudprovider.NewNodeClassNotReadyError(stderrors.New("AKSNodeClass spec.fipsMode must be set to FIPS because FIPS is enabled at the cluster level"))
 	}
@@ -200,6 +204,7 @@ func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1
 	if err != nil {
 		return nil, err
 	}
+	maps.Copy(newNodeClaim.Annotations, vmPromise.NodeClaimAnnotations)
 	// Propagate single-value wellKnownLabels from the nodeClaim requirements to the labels.
 	// This is required for scheduling in core to work correctly. If this is not done, on subsequent scheduling passes before the Node is
 	// registered, the NodeClaim will not have the labels required to match the Pod and so a new NodeClaim will be created each time.
@@ -207,6 +212,10 @@ func (c *CloudProvider) createVMInstance(ctx context.Context, nodeClass *v1beta1
 	// rather than doing it in bulk here.
 	// TODO: should we do like AWS and smuggle all of these labels through VM tags rather than just setting them here?
 	newNodeClaim.Labels = lo.Assign(newNodeClaim.Labels, labelspkg.GetWellKnownSingleValuedRequirementLabels(scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)))
+	if len(nodeClass.Spec.Regions) > 0 {
+		newNodeClaim.Labels[corev1.LabelTopologyRegion] = lo.FromPtr(vm.Location)
+		newNodeClaim.Labels[corev1.LabelNodeExcludeBalancers] = "true"
+	}
 
 	if err := setAdditionalAnnotationsForNewNodeClaim(ctx, newNodeClaim, nodeClass); err != nil {
 		return nil, err
@@ -763,6 +772,7 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 	}
 
 	labels[karpv1.CapacityTypeLabelKey] = instance.GetCapacityTypeFromVM(vm)
+	setRegionLabelFromVM(ctx, vm, labels)
 	labels[v1beta1.AKSLabelScaleSetPriority] = instance.GetScaleSetPriorityLabelFromVM(vm)
 	labels[v1beta1.AKSLabelPriority] = instance.GetPriorityLabelFromVM(vm)
 	labels[v1beta1.LabelUltraSSD] = fmt.Sprint(instance.GetUltraSSDEnabled(vm))
@@ -796,6 +806,18 @@ func (c *CloudProvider) vmInstanceToNodeClaim(ctx context.Context, vm *armcomput
 		nodeClaim.Status.ImageID = utils.ImageReferenceToString(vm.Properties.StorageProfile.ImageReference)
 	}
 	return nodeClaim, nil
+}
+
+// setRegionLabelFromVM sets the region label of a VM's NodeClaim from the VM's location when multi-region
+// provisioning is on: a VM can then run outside the home region, and its instance type can be offered in
+// several regions. Without it, the instance type's region gives the label, as before the feature existed.
+func setRegionLabelFromVM(ctx context.Context, vm *armcompute.VirtualMachine, labels map[string]string) {
+	if opts := options.FromContext(ctx); opts == nil || !opts.EnableMultiRegion {
+		return
+	}
+	if location := lo.FromPtr(vm.Location); location != "" && !strings.EqualFold(labels[corev1.LabelTopologyRegion], location) {
+		labels[corev1.LabelTopologyRegion] = location
+	}
 }
 
 func GetNodeClaimNameFromVMName(vmName string) string {

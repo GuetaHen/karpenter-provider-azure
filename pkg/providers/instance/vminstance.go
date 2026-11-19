@@ -916,11 +916,14 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		return nil, fmt.Errorf("getting launch template: %w", err)
 	}
 
-	backendPools, err := p.loadBalancerProvider.LoadBalancerBackendPools(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting backend pools: %w", err)
+	backendPools := &loadbalancer.BackendAddressPools{}
+	if len(nodeClass.Spec.Regions) == 0 {
+		backendPools, err = p.loadBalancerProvider.LoadBalancerBackendPools(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting backend pools: %w", err)
+		}
+		backendPools = filterBackendPools(backendPools, nodeClaim)
 	}
-	backendPools = filterBackendPools(backendPools, nodeClaim)
 	networkPlugin := options.FromContext(ctx).NetworkPlugin
 	networkPluginMode := options.FromContext(ctx).NetworkPluginMode
 
@@ -929,7 +932,7 @@ func (p *DefaultVMProvider) beginLaunchInstance(
 		return nil, fmt.Errorf("checking if vnet is managed: %w", err)
 	}
 	var nsgID string
-	if !isAKSManagedVNET {
+	if !isAKSManagedVNET && len(nodeClass.Spec.Regions) == 0 {
 		nsg, err := p.networkSecurityGroupProvider.ManagedNetworkSecurityGroup(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("getting managed network security group: %w", err)

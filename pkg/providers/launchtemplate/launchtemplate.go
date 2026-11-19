@@ -167,13 +167,18 @@ func (p *Provider) getStaticParameters(
 	// ATTENTION!!!: changes here will NOT be effective on AKS machine nodes (ProvisionModeAKSMachineAPI); See aksmachineinstance.go/aksmachineinstancehelpers.go.
 	// Refactoring for code unification is not being invested immediately.
 
-	nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("getting managed network security group: %w", err)
+	var nsgName, routeTableName string
+	if len(nodeClass.Spec.Regions) == 0 {
+		nsg, err := p.nsgProvider.ManagedNetworkSecurityGroup(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("getting managed network security group: %w", err)
+		}
+		nsgName = lo.FromPtr(nsg.Name)
+		clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
+		routeTableName = fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
+	} else {
+		labels[v1.LabelNodeExcludeBalancers] = "true"
 	}
-	nsgName := lo.FromPtr(nsg.Name)
-	clusterID := networksecuritygroup.GetClusterIDFromNSGName(nsgName)
-	routeTableName := fmt.Sprintf("aks-agentpool-%s-routetable", clusterID)
 
 	return &parameters.StaticParameters{
 		ClusterName:                    options.FromContext(ctx).ClusterName,

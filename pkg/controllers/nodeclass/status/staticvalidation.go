@@ -170,10 +170,6 @@ func (r *StaticValidationReconciler) validateRegions(ctx context.Context, nodeCl
 	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
 		return fail(options.RegionsErrorReason(err), err.Error()), nil
 	}
-	if len(nodeClass.Spec.Regions) > 0 {
-		// Nothing launches the nodes of an AKSNodeClass in its regions yet.
-		return fail(options.ReasonMultiRegionUnsupportedConfiguration, "spec.regions is not supported yet"), nil
-	}
 	return pass(), nil
 }
 
