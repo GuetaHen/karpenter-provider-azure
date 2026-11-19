@@ -88,6 +88,7 @@ type Environment struct {
 	vnetClient           *armnetwork.VirtualNetworksClient
 	subnetClient         *armnetwork.SubnetsClient
 	interfacesClient     *armnetwork.InterfacesClient
+	vnetPeeringsClient   *armnetwork.VirtualNetworkPeeringsClient
 	managedClusterClient *containerservice.ManagedClustersClient
 	agentPoolClient      *containerservice.AgentPoolsClient
 	machinesClient       *containerservice.MachinesClient
@@ -174,6 +175,7 @@ func NewEnvironment(t *testing.T) *Environment {
 	azureEnv.vnetClient = lo.Must(armnetwork.NewVirtualNetworksClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.subnetClient = lo.Must(armnetwork.NewSubnetsClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.interfacesClient = lo.Must(armnetwork.NewInterfacesClient(azureEnv.SubscriptionID, cred, clientOptions))
+	azureEnv.vnetPeeringsClient = lo.Must(armnetwork.NewVirtualNetworkPeeringsClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.managedClusterClient = lo.Must(containerservice.NewManagedClustersClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.agentPoolClient = lo.Must(containerservice.NewAgentPoolsClient(azureEnv.SubscriptionID, cred, clientOptions))
 	azureEnv.machinesClient = lo.Must(containerservice.NewMachinesClient(azureEnv.SubscriptionID, cred, clientOptions))
