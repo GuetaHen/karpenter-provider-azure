@@ -42,6 +42,16 @@ import (
 
 var ctx context.Context
 
+const regionClientID = "11111111-2222-3333-4444-555555555555"
+
+func identityID(name string) string {
+	return "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/" + name
+}
+
+func identitiesJSON(region, identity, clientID string) string {
+	return `"` + region + `": {"nodeIdentities": ["` + identity + `"], "kubeletIdentityClientID": "` + clientID + `"}`
+}
+
 var _ = Describe("Multi-region configuration", func() {
 	It("rejects spec.regions unless the controller enables multi-region provisioning", func() {
 		opts := &options.Options{ProvisionMode: consts.ProvisionModeAKSScriptless, NetworkPlugin: consts.NetworkPluginNone}
@@ -114,6 +124,47 @@ var _ = Describe("Multi-region configuration", func() {
 		Entry("aksmachineapi", consts.ProvisionModeAKSMachineAPI),
 		Entry("aksmachineapiheaderbatch", consts.ProvisionModeAKSMachineAPIHeaderBatch),
 	)
+
+	It("replaces the global identities only for regions with an entry", func() {
+		opts := &options.Options{EnableMultiRegion: true, NodeIdentities: []string{identityID("global")}, KubeletIdentityClientID: "61f71907-753f-4802-a901-47361c3664f2"}
+		opts.SetMultiRegionNodeIdentitiesJSON("{" + identitiesJSON("WestUS2", identityID("west"), regionClientID) + "}")
+		Expect(opts.ValidateMultiRegionOptions()).To(Succeed())
+		Expect(opts.NodeIdentitiesFor("westus2")).To(Equal([]string{identityID("west")}))
+		Expect(opts.KubeletIdentityClientIDFor("WESTUS2")).To(Equal(regionClientID))
+		Expect(opts.NodeIdentitiesFor("eastus")).To(Equal([]string{identityID("global")}))
+		Expect(opts.KubeletIdentityClientIDFor("eastus")).To(Equal(opts.KubeletIdentityClientID))
+		Expect(opts.ValidateHomeLocation("eastus")).To(Succeed())
+		Expect(opts.ValidateHomeLocation("WestUS2")).To(MatchError(ContainSubstring("cluster region")))
+	})
+
+	It("keeps every identity of the global list and of a per-region entry", func() {
+		opts := &options.Options{EnableMultiRegion: true, NodeIdentities: []string{identityID("global"), identityID("addon")}, KubeletIdentityClientID: "61f71907-753f-4802-a901-47361c3664f2"}
+		opts.SetMultiRegionNodeIdentitiesJSON(`{"westus2": {"nodeIdentities": ["` + identityID("west") + `", "` + identityID("addon") + `"], "kubeletIdentityClientID": "` + regionClientID + `"}}`)
+		Expect(opts.ValidateMultiRegionOptions()).To(Succeed())
+		Expect(opts.NodeIdentitiesFor("westus2")).To(Equal([]string{identityID("west"), identityID("addon")}))
+		Expect(opts.NodeIdentitiesFor("eastus")).To(Equal([]string{identityID("global"), identityID("addon")}))
+	})
+
+	DescribeTable("rejects malformed per-region identities",
+		func(raw, message string) {
+			opts := &options.Options{EnableMultiRegion: true}
+			opts.SetMultiRegionNodeIdentitiesJSON(raw)
+			Expect(opts.ValidateMultiRegionOptions()).To(MatchError(ContainSubstring(message)))
+		},
+		Entry("not JSON", "westus2", "JSON object"),
+		Entry("unknown field", `{"westus2": {"identities": []}}`, "JSON object"),
+		Entry("duplicate region", "{"+identitiesJSON("westus2", identityID("a"), regionClientID)+", "+identitiesJSON("WestUS2", identityID("a"), regionClientID)+"}", "more than once"),
+		Entry("invalid region", "{"+identitiesJSON("west-us", identityID("a"), regionClientID)+"}", "invalid region"),
+		Entry("no identities", `{"westus2": {"nodeIdentities": [], "kubeletIdentityClientID": "`+regionClientID+`"}}`, "at least one identity"),
+		Entry("not an identity", "{"+identitiesJSON("westus2", "/subscriptions/s/resourceGroups/r/providers/Microsoft.Compute/virtualMachines/vm", regionClientID)+"}", "user-assigned identity resource IDs"),
+		Entry("malformed client ID", "{"+identitiesJSON("westus2", identityID("a"), "client")+"}", "client ID"),
+	)
+
+	It("requires multi-region provisioning for per-region identities", func() {
+		opts := &options.Options{}
+		opts.SetMultiRegionNodeIdentitiesJSON("{" + identitiesJSON("westus2", identityID("a"), regionClientID) + "}")
+		Expect(opts.ValidateMultiRegionOptions()).To(MatchError(ContainSubstring("requires enable-multi-region")))
+	})
 })
 
 func TestAPIs(t *testing.T) {

@@ -21,6 +21,7 @@ import (
 	"hash/fnv"
 	"strconv"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 
@@ -74,7 +75,8 @@ func HashFromNodeClaim(options *options.Options, nodeClaim *karpv1.NodeClaim, no
 	} else {
 		// VM instance-based node
 		hashStruct = &vmInPlaceUpdateFields{
-			Identities: sets.New(options.NodeIdentities...),
+			// MULTI_REGION_NODE_IDENTITIES can give the NodeClaim's region its own identities.
+			Identities: sets.New(options.NodeIdentitiesFor(nodeClaim.Labels[corev1.LabelTopologyRegion])...),
 			Tags:       tagsForHash,
 		}
 	}

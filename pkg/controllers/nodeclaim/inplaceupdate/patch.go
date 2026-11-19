@@ -144,7 +144,8 @@ func patchVMIdentities(
 	params *patchParameters,
 	currentVM *armcompute.VirtualMachine,
 ) bool {
-	expectedIdentities := params.opts.NodeIdentities
+	// A VM in another region keeps its region's identities and is never repaired to the global ones.
+	expectedIdentities := params.opts.NodeIdentitiesFor(lo.FromPtr(currentVM.Location))
 	var currentIdentities []string
 	if currentVM.Identity != nil {
 		currentIdentities = lo.Keys(currentVM.Identity.UserAssignedIdentities)

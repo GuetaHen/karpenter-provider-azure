@@ -17,13 +17,17 @@ limitations under the License.
 package options
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
+	"github.com/google/uuid"
 	"github.com/samber/lo"
 )
 
@@ -136,4 +140,102 @@ func validateMultiRegionTargets(regions []v1beta1.Region) error {
 // are not verified for nodes in other regions.
 func (o *Options) multiRegionNetworkSupported() bool {
 	return o.IsNetworkPluginNone() && o.NetworkPluginMode == ""
+}
+
+// MultiRegionNodeIdentity is the identity configuration of the VMs in one region.
+type MultiRegionNodeIdentity struct {
+	NodeIdentities          []string `json:"nodeIdentities"`
+	KubeletIdentityClientID string   `json:"kubeletIdentityClientID"`
+}
+
+// NodeIdentitiesFor returns the user-assigned identities for the VMs in location.
+func (o *Options) NodeIdentitiesFor(location string) []string {
+	if identity, ok := o.regionIdentity(location); ok {
+		return identity.NodeIdentities
+	}
+	return o.NodeIdentities
+}
+
+// KubeletIdentityClientIDFor returns the kubelet identity client ID for the nodes in location.
+func (o *Options) KubeletIdentityClientIDFor(location string) string {
+	if identity, ok := o.regionIdentity(location); ok {
+		return identity.KubeletIdentityClientID
+	}
+	return o.KubeletIdentityClientID
+}
+
+func (o *Options) regionIdentity(location string) (MultiRegionNodeIdentity, bool) {
+	if len(o.MultiRegionNodeIdentities) == 0 {
+		return MultiRegionNodeIdentity{}, false
+	}
+	identity, ok := o.MultiRegionNodeIdentities[strings.ToLower(location)]
+	return identity, ok
+}
+
+// ValidateHomeLocation rejects a node identity override for the cluster region, whose nodes
+// always use --node-identities and --kubelet-identity-client-id.
+func (o *Options) ValidateHomeLocation(home string) error {
+	if _, ok := o.regionIdentity(home); ok {
+		return fmt.Errorf("multi-region-node-identities must not contain the cluster region %q", strings.ToLower(home))
+	}
+	return nil
+}
+
+func (o *Options) validateMultiRegionOptions() error {
+	if err := o.parseMultiRegionNodeIdentities(); err != nil {
+		return err
+	}
+	if len(o.MultiRegionNodeIdentities) == 0 {
+		return nil
+	}
+	if !o.EnableMultiRegion {
+		return fmt.Errorf("multi-region-node-identities requires enable-multi-region")
+	}
+	for _, region := range slices.Sorted(maps.Keys(o.MultiRegionNodeIdentities)) {
+		if err := validateMultiRegionNodeIdentity(region, o.MultiRegionNodeIdentities[region]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// parseMultiRegionNodeIdentities decodes --multi-region-node-identities with lowercase region keys.
+func (o *Options) parseMultiRegionNodeIdentities() error {
+	if o.multiRegionNodeIdentitiesJSON == "" {
+		return nil
+	}
+	identities := map[string]MultiRegionNodeIdentity{}
+	decoder := json.NewDecoder(strings.NewReader(o.multiRegionNodeIdentitiesJSON))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&identities); err != nil {
+		return fmt.Errorf("multi-region-node-identities must be a JSON object that maps a region to nodeIdentities and kubeletIdentityClientID: %w", err)
+	}
+	o.MultiRegionNodeIdentities = make(map[string]MultiRegionNodeIdentity, len(identities))
+	for region, identity := range identities {
+		key := strings.ToLower(region)
+		if _, ok := o.MultiRegionNodeIdentities[key]; ok {
+			return fmt.Errorf("multi-region-node-identities lists region %q more than once", key)
+		}
+		o.MultiRegionNodeIdentities[key] = identity
+	}
+	return nil
+}
+
+func validateMultiRegionNodeIdentity(region string, identity MultiRegionNodeIdentity) error {
+	if !regionNamePattern.MatchString(region) {
+		return fmt.Errorf("multi-region-node-identities contains an invalid region %q", region)
+	}
+	if len(identity.NodeIdentities) == 0 {
+		return fmt.Errorf("multi-region-node-identities[%s].nodeIdentities must list at least one identity", region)
+	}
+	for _, id := range identity.NodeIdentities {
+		parsed, err := arm.ParseResourceID(id)
+		if err != nil || !strings.EqualFold(parsed.ResourceType.String(), "Microsoft.ManagedIdentity/userAssignedIdentities") {
+			return fmt.Errorf("multi-region-node-identities[%s].nodeIdentities must contain user-assigned identity resource IDs, got %q", region, id)
+		}
+	}
+	if uuid.Validate(identity.KubeletIdentityClientID) != nil {
+		return fmt.Errorf("multi-region-node-identities[%s].kubeletIdentityClientID must be a client ID", region)
+	}
+	return nil
 }

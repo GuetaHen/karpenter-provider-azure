@@ -140,6 +140,8 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 
 	log.FromContext(ctx).V(0).Info("Initial AZConfig", "azConfig", azConfig.String())
 
+	lo.Must0(options.FromContext(ctx).ValidateHomeLocation(azConfig.Location), "validating multi-region options")
+
 	env, err := auth.ResolveCloudEnvironment(azConfig)
 	lo.Must0(err, "resolving cloud environment")
 
@@ -333,7 +335,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 			resolver := imagefamily.NewDefaultResolver(operator.GetClient(), images, types, azClient.NodeBootstrappingClient)
 			templates := launchtemplate.NewProvider(ctx, resolver, images, networkSecurityGroupProvider,
 				lo.Must(getCABundle(operator.GetConfig())), options.FromContext(ctx).ClusterEndpoint,
-				azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientID,
+				azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientIDFor(location),
 				options.FromContext(ctx).NodeResourceGroup, location, options.FromContext(ctx).ProvisionMode)
 			// Cross-region selection uses the existing price/capacity ranker, not
 			// a home-region placement-score request or fabricated per-region prices.
