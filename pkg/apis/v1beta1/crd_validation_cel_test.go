@@ -95,6 +95,35 @@ var _ = Describe("CEL/Validation", func() {
 			},
 		}
 	})
+	Context("Regions", func() {
+		DescribeTable("should validate region entries", func(regions []v1beta1.Region, subnet *string, valid bool) {
+			nc := &v1beta1.AKSNodeClass{
+				ObjectMeta: metav1.ObjectMeta{Name: strings.ToLower(randomdata.SillyName())},
+				Spec:       v1beta1.AKSNodeClassSpec{Regions: regions, VNETSubnetID: subnet},
+			}
+			err := env.Client.Create(ctx, nc)
+			if valid {
+				Expect(err).ToNot(HaveOccurred())
+				Expect(env.Client.Get(ctx, client.ObjectKeyFromObject(nc), nc)).To(Succeed())
+				Expect(nc.Spec.Regions).To(Equal(regions))
+			} else {
+				Expect(err).To(HaveOccurred())
+			}
+		},
+			Entry("two regions", []v1beta1.Region{
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+				{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+			}, nil, true),
+			Entry("duplicate locations", []v1beta1.Region{
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+				{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"},
+			}, nil, false),
+			Entry("display name rather than location", []v1beta1.Region{{Name: "East US 2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}}, nil, false),
+			Entry("invalid subnet", []v1beta1.Region{{Name: "eastus2", VNETSubnetID: "not-an-arm-id"}}, nil, false),
+			Entry("conflicting subnet fields", []v1beta1.Region{{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}},
+				lo.ToPtr("/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/default"), false),
+		)
+	})
 	Context("Kubelet overrides", func() {
 		DescribeTable("should validate kubeReserved", func(kubeReserved *v1beta1.KubeReserved, expected bool) {
 			nodeClass := &v1beta1.AKSNodeClass{

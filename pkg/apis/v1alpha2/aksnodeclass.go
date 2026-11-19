@@ -58,6 +58,23 @@ type ArtifactStreaming struct {
 	Enabled *bool `json:"enabled,omitempty"`
 }
 
+// Region selects a physical Azure region and its pre-existing node subnet.
+type Region struct {
+	// name is the Azure location name, for example eastus2.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9]+$`
+	// +kubebuilder:validation:MinLength=2
+	// +kubebuilder:validation:MaxLength=64
+	// +required
+	Name string `json:"name,omitempty"`
+	// vnetSubnetID must belong to this region and the cluster's subscription.
+	// The subnet must have an NSG, outbound connectivity, and connectivity to the
+	// API server and every other node subnet. Karpenter does not create networks.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`
+	// +required
+	VNETSubnetID string `json:"vnetSubnetID,omitempty"`
+}
+
 // CapacityReservationConfiguration configures the Capacity Reservation Group
 // that instances provisioned by this NodeClass target.
 type CapacityReservationConfiguration struct {
@@ -141,7 +158,21 @@ type IPTag struct {
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation requires imageFamily AzureLinux",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (has(self.imageFamily) && self.imageFamily == 'AzureLinux') : true"
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation is not supported with fipsMode FIPS",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (!has(self.fipsMode) || self.fipsMode != 'FIPS') : true"
 // +kubebuilder:validation:XValidation:message="workloadRuntime KataVmIsolation is not supported with TrustedLaunch",rule="has(self.workloadRuntime) && self.workloadRuntime == 'KataVmIsolation' ? (!has(self.security) || !has(self.security.trustedLaunch) || !((has(self.security.trustedLaunch.vtpm) && self.security.trustedLaunch.vtpm) || (has(self.security.trustedLaunch.secureBoot) && self.security.trustedLaunch.secureBoot))) : true"
+// +kubebuilder:validation:XValidation:message="regions and vnetSubnetID are mutually exclusive",rule="!has(self.regions) || !has(self.vnetSubnetID)"
 type AKSNodeClassSpec struct {
+	// regions opts into experimental multi-region VM provisioning, which the controller
+	// option --enable-multi-region gates. Only listed regions are eligible; the cluster
+	// region is not implicitly included. Requires aksscriptless provisioning and a
+	// bring-your-own CNI (networkPlugin none) whose pod network reaches all listed regions.
+	// Azure CNI in any mode, and the AKS Machine API and bootstrappingclient provisioning
+	// modes, are not supported. Nodes are excluded from Azure load balancers. Omit this
+	// field to preserve the existing single-region behavior.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=8
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Regions []Region `json:"regions,omitempty" hash:"ignore"` // Placement drift is evaluated per NodeClaim, so editing regions only replaces nodes whose region or subnet is removed.
 	// vnetSubnetID is the subnet used by nics provisioned with this nodeclass.
 	// If not specified, we will use the default --vnet-subnet-id specified in karpenter's options config
 	// +kubebuilder:validation:Pattern=`(?i)^\/subscriptions\/[^\/]+\/resourceGroups\/[a-zA-Z0-9_\-().]{0,89}[a-zA-Z0-9_\-()]\/providers\/Microsoft\.Network\/virtualNetworks\/[^\/]+\/subnets\/[^\/]+$`

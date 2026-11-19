@@ -68,6 +68,7 @@ var _ = Describe("Hash", func() {
 			Expect(nodeClass.Hash()).To(Equal(hash))
 		},
 		Entry("Base AKSNodeClass", staticHash, v1alpha2.AKSNodeClass{}),
+		Entry("empty regions pre-feature compatibility", staticHash, v1alpha2.AKSNodeClass{Spec: v1alpha2.AKSNodeClassSpec{Regions: []v1alpha2.Region{}}}),
 
 		// Static fields, expect changed hash from base
 		Entry("VNETSubnetID", "13971920214979852468", v1alpha2.AKSNodeClass{Spec: v1alpha2.AKSNodeClassSpec{VNETSubnetID: lo.ToPtr("subnet-id-2")}}),
@@ -111,6 +112,20 @@ var _ = Describe("Hash", func() {
 		Entry("ArtifactStreaming.Enabled", v1alpha2.AKSNodeClass{Spec: v1alpha2.AKSNodeClassSpec{ArtifactStreaming: &v1alpha2.ArtifactStreaming{Enabled: lo.ToPtr(true)}}}),
 		Entry("NodePublicIP.Enabled", v1alpha2.AKSNodeClass{Spec: v1alpha2.AKSNodeClassSpec{NodePublicIP: &v1alpha2.NodePublicIP{Enabled: lo.ToPtr(true)}}}),
 	)
+	Context("Regions", func() {
+		It("should exclude regions so that only placement drift replaces multi-region nodes", func() {
+			Expect(nodeClass.Hash()).To(Equal(staticHash))
+			east := v1alpha2.Region{Name: "eastus2", VNETSubnetID: "/subscriptions/example/resourceGroups/east/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}
+			west := v1alpha2.Region{Name: "westus2", VNETSubnetID: "/subscriptions/example/resourceGroups/west/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"}
+			changed := v1alpha2.Region{Name: west.Name, VNETSubnetID: strings.ToUpper(west.VNETSubnetID) + "-new"}
+			for _, regions := range [][]v1alpha2.Region{{east}, {east, west}, {west, east}, {west}, {changed}, {}, nil} {
+				nodeClass.Spec.Regions = regions
+				original := nodeClass.DeepCopy()
+				Expect(nodeClass.Hash()).To(Equal(staticHash), "add, reorder, remove and subnet changes are placement changes")
+				Expect(nodeClass).To(Equal(original), "hashing must not mutate the NodeClass")
+			}
+		})
+	})
 	Context("NodePublicIP", func() {
 		const (
 			prefixID      = "/subscriptions/12345678-1234-1234-1234-123456789012/resourceGroups/rg/providers/Microsoft.Network/publicIPPrefixes/prefix"

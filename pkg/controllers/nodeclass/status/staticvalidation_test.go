@@ -225,6 +225,22 @@ var _ = Describe("Validation Reconciler", func() {
 		})
 	})
 
+	Context("regions", func() {
+		It("should fail validation when spec.regions is set", func() {
+			nodeClass.Spec.Regions = []v1beta1.Region{{
+				Name:         "westus3",
+				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg/providers/Microsoft.Network/virtualNetworks/vnet/subnets/nodes",
+			}}
+
+			_, err := reconciler.Reconcile(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred())
+
+			condition := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeValidationSucceeded)
+			Expect(condition.IsTrue()).To(BeFalse())
+			Expect(condition.Reason).To(Equal("MultiRegionUnsupportedConfiguration"))
+		})
+	})
+
 	Context("image family Kubernetes version compatibility", func() {
 		setVersion := func(version string) {
 			nodeClass.Status.KubernetesVersion = lo.ToPtr(version)
