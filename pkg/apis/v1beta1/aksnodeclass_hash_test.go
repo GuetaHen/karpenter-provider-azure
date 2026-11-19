@@ -140,6 +140,22 @@ var _ = Describe("Hash", func() {
 				Expect(nodeClass).To(Equal(original), "hashing must not mutate the NodeClass")
 			}
 		})
+		It("should keep the hash that the fork commit 3989013e computed for a NodeClass with regions", func() {
+			// 3989013e runs on clusters before this commit. Its AKSNodeClass.Hash() returns this value for the
+			// spec below under hash version v3. If the value changes, the nodes that 3989013e launched drift.
+			forkClass := v1beta1.AKSNodeClass{Spec: v1beta1.AKSNodeClassSpec{
+				ImageFamily:  lo.ToPtr(v1beta1.AzureLinuxImageFamily),
+				FIPSMode:     lo.ToPtr(v1beta1.FIPSModeFIPS),
+				Security:     &v1beta1.Security{EncryptionAtHost: lo.ToPtr(true)},
+				OSDiskSizeGB: lo.ToPtr[int32](128),
+				Regions: []v1beta1.Region{{
+					Name:         "centralus",
+					VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/nodes-centralus/providers/Microsoft.Network/virtualNetworks/workers/subnets/workers",
+				}},
+			}}
+			Expect(forkClass.Hash()).To(Equal("5301018574985557402"))
+			Expect(v1beta1.AKSNodeClassHashVersion).To(Equal("v3"))
+		})
 	})
 	Context("NodePublicIP", func() {
 		const (

@@ -782,6 +782,54 @@ var _ = Describe("CloudProvider", func() {
 					ExpectScheduled(ctx, env.Client, pod)
 					Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.RegionNonZonal))
 				})
+
+				It("should not drift a NodeClaim that the fork commit 3989013e launched", func() {
+					// 3989013e runs on clusters before this commit. For the hashed fields below, its
+					// AKSNodeClass.Hash() returns forkHash under hash version v3. It records the placement in the
+					// same annotation, as the JSON of the region.
+					const forkHash = "5301018574985557402"
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					node := ExpectScheduled(ctx, env.Client, pod)
+					version, err := nodeClass.GetKubernetesVersion()
+					Expect(err).ToNot(HaveOccurred())
+					node.Status.NodeInfo.KubeletVersion = "v" + version
+					ExpectApplied(ctx, env.Client, node)
+					nodeClaims := &karpv1.NodeClaimList{}
+					Expect(env.Client.List(ctx, nodeClaims)).To(Succeed())
+					Expect(nodeClaims.Items).To(HaveLen(1))
+					claim := &nodeClaims.Items[0]
+					placement := nodeClass.Spec.Regions[1]
+					Expect(placement.Name).To(Equal(fake.RegionNonZonal))
+					nodeClass.Spec = v1beta1.AKSNodeClassSpec{
+						ImageFamily:  lo.ToPtr(v1beta1.AzureLinuxImageFamily),
+						FIPSMode:     lo.ToPtr(v1beta1.FIPSModeFIPS),
+						Security:     &v1beta1.Security{EncryptionAtHost: lo.ToPtr(true)},
+						OSDiskSizeGB: lo.ToPtr[int32](128),
+						Regions:      nodeClass.Spec.Regions,
+					}
+					Expect(nodeClass.Hash()).To(Equal(forkHash))
+					nodeClass.Annotations = lo.Assign(nodeClass.Annotations, map[string]string{
+						v1beta1.AnnotationAKSNodeClassHash:        nodeClass.Hash(),
+						v1beta1.AnnotationAKSNodeClassHashVersion: v1beta1.AKSNodeClassHashVersion,
+					})
+					claim.Annotations = lo.Assign(claim.Annotations, map[string]string{
+						v1beta1.AnnotationAKSNodeClassHash:        forkHash,
+						v1beta1.AnnotationAKSNodeClassHashVersion: "v3",
+						multiregion.PlacementAnnotation:           fmt.Sprintf(`{"name":%q,"vnetSubnetID":%q}`, placement.Name, placement.VNETSubnetID),
+					})
+					Expect(cloudProvider.isNodeClassDrifted(ctx, claim, nodeClass)).To(Equal(NoDrift))
+
+					// The same NodeClaim drifts once the subnet of its region or a hashed field changes.
+					moved := nodeClass.DeepCopy()
+					moved.Spec.Regions[1].VNETSubnetID += "-new"
+					Expect(cloudProvider.isNodeClassDrifted(ctx, claim, moved)).To(Equal(MultiRegionPlacementDrift))
+					resized := nodeClass.DeepCopy()
+					resized.Spec.OSDiskSizeGB = lo.ToPtr[int32](256)
+					resized.Annotations[v1beta1.AnnotationAKSNodeClassHash] = resized.Hash()
+					Expect(cloudProvider.isNodeClassDrifted(ctx, claim, resized)).To(Equal(NodeClassDrift))
+				})
 			})
 
 			Context("Home-first NodePools", func() {
