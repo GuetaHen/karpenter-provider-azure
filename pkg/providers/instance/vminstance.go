@@ -131,6 +131,8 @@ type Resource = map[string]interface{}
 type VirtualMachinePromise struct {
 	VM       *armcompute.VirtualMachine
 	WaitFunc func() error
+	// NodeClaimAnnotations carries durable launch metadata back to core's lifecycle reconciler.
+	NodeClaimAnnotations map[string]string
 	// CreateIssued is false when an existing VM was reused.
 	CreateIssued bool
 
