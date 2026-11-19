@@ -32,6 +32,10 @@ import (
 
 const (
 	testUnavailableOfferingsTTL = 2 * time.Second
+	// testExpiryMargin is added to testUnavailableOfferingsTTL where a test waits for entries to expire.
+	// The cache compares expirations with the wall clock, which can fall behind the monotonic clock that
+	// time.Sleep measures, for example when the clock of a virtual machine is adjusted.
+	testExpiryMargin = time.Second
 )
 
 func createTestSKU(name, familyName, size string, cpuCount int) *skewer.SKU {
@@ -87,7 +91,7 @@ func TestUnavailableOfferings(t *testing.T) {
 	assertOfferingAvailable(t, u, testSKU, "westus", karpv1.CapacityTypeOnDemand, "Offering should be available for different capacity type")
 
 	// wait for the cache entry to expire
-	time.Sleep(testUnavailableOfferingsTTL)
+	time.Sleep(testUnavailableOfferingsTTL + testExpiryMargin)
 
 	// test that the offering is no longer marked as unavailable
 	assertOfferingAvailable(t, u, testSKU, "westus", karpv1.CapacityTypeSpot, "Offering should not be marked as unavailable after cache entry has expired")
@@ -119,7 +123,7 @@ func TestUnavailableOfferingsVMFamilyCoreLimitAllowsFewerCores(t *testing.T) {
 	assertOfferingUnavailable(t, u, nv24, "westus-1", karpv1.CapacityTypeOnDemand, "24 CPU offering should be unavailable after partial family marking")
 
 	// Wait for cache expiration
-	time.Sleep(testUnavailableOfferingsTTL)
+	time.Sleep(testUnavailableOfferingsTTL + testExpiryMargin)
 
 	// Test that offerings are no longer marked as unavailable after expiration
 	for _, sku := range skus {
@@ -161,7 +165,7 @@ func TestUnavailableOfferingsVMFamilyBlocksAll(t *testing.T) {
 	assertOfferingAvailable(t, u, differentVersionSKU, "westus-1", karpv1.CapacityTypeOnDemand, "Offering from a different version of the same VM family should be available")
 
 	// Wait for cache expiration
-	time.Sleep(testUnavailableOfferingsTTL)
+	time.Sleep(testUnavailableOfferingsTTL + testExpiryMargin)
 
 	// Test that all offerings are now marked as available after expiration
 	for _, sku := range skus {
@@ -250,7 +254,7 @@ func TestUnavailableOfferingsRestrictiveLimitPreservation(t *testing.T) {
 	}
 
 	// Wait for cache expiration
-	time.Sleep(testUnavailableOfferingsTTL)
+	time.Sleep(testUnavailableOfferingsTTL + testExpiryMargin)
 
 	// Verify all offerings are available again after expiration
 	for _, sku := range skus {
@@ -391,7 +395,7 @@ func TestUnavailableOfferings_MarkSKUZoneUnavailableWithTTLExpiration(t *testing
 		t.Fatal("expected a duplicate mark to refresh the TTL without changing the generation")
 	}
 
-	time.Sleep(testUnavailableOfferingsTTL)
+	time.Sleep(testUnavailableOfferingsTTL + testExpiryMargin)
 	singleInstanceCache.DeleteExpired()
 	if view.IsUnavailable(sku, "westus-1", karpv1.CapacityTypeOnDemand) || u.SeqNum() != 2 {
 		t.Fatal("expected expiry to restore availability and advance the cache generation")
