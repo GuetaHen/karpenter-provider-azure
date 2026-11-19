@@ -678,6 +678,99 @@ var _ = Describe("CloudProvider", func() {
 				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2), "retries must adopt the original VM")
 				Expect(azureEnv.LoadBalancersAPI.NewListPagerBehavior.CalledWithInput.Len()).To(BeZero())
 			})
+			Context("Home-first NodePools", func() {
+				// One controller owns both NodePools. The home NodePool has the higher weight and an
+				// AKSNodeClass without spec.regions; the overflow NodePool lists only another region.
+				var homeClass *v1beta1.AKSNodeClass
+				var homePool *karpv1.NodePool
+				// vms keeps the VMs that the controller created, because reading them drains the fake API.
+				var vms map[string]armcompute.VirtualMachine
+				BeforeEach(func() {
+					vms = map[string]armcompute.VirtualMachine{}
+					homeClass = test.AKSNodeClass(test.WithVersionBasedDefaults(env.Version))
+					test.ApplyDefaultStatus(homeClass, env, testOptions.UseSIG)
+					homePool = coretest.NodePool(karpv1.NodePool{Spec: karpv1.NodePoolSpec{
+						Weight: lo.ToPtr(int32(100)),
+						Template: karpv1.NodeClaimTemplate{Spec: karpv1.NodeClaimTemplateSpec{NodeClassRef: &karpv1.NodeClassReference{
+							Group: object.GVK(homeClass).Group, Kind: object.GVK(homeClass).Kind, Name: homeClass.Name,
+						}}},
+					}})
+					nodePool.Spec.Weight = lo.ToPtr(int32(10))
+					nodeClass.Spec.Regions = nodeClass.Spec.Regions[1:]
+				})
+				// podWithOwnNode returns a pod that needs a Standard_D2_v3 node of its own.
+				podWithOwnNode := func() *v1.Pod {
+					return coretest.UnschedulablePod(coretest.PodOptions{
+						NodeSelector:         map[string]string{v1.LabelInstanceTypeStable: "Standard_D2_v3"},
+						ResourceRequirements: v1.ResourceRequirements{Requests: v1.ResourceList{v1.ResourceCPU: resource.MustParse("1500m")}},
+					})
+				}
+				// expectLaunched checks that pool launched one VM in each of regions, and that only the
+				// nodes of the overflow NodePool have a multi-region placement and leave the load balancers.
+				expectLaunched := func(pool *karpv1.NodePool, regions ...string) {
+					GinkgoHelper()
+					for input := range azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.All() {
+						vms[input.VMName] = input.VM
+					}
+					var launched []string
+					for _, claim := range ExpectNodeClaims(ctx, env.Client) {
+						if claim.Labels[karpv1.NodePoolLabelKey] != pool.Name {
+							continue
+						}
+						vmName := instance.GenerateResourceName(claim.Name)
+						vm, ok := vms[vmName]
+						Expect(ok).To(BeTrue(), "no VM was created for NodeClaim %s", claim.Name)
+						launched = append(launched, lo.FromPtr(vm.Location))
+						customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(vm.Properties.OSProfile.CustomData))
+						Expect(err).ToNot(HaveOccurred())
+						nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, vmName, nil)
+						Expect(err).ToNot(HaveOccurred())
+						subnetID := lo.FromPtr(nic.Properties.IPConfigurations[0].Properties.Subnet.ID)
+						if pool.Name == nodePool.Name {
+							Expect(claim.Annotations).To(HaveKey(multiregion.PlacementAnnotation))
+							Expect(string(customData)).To(ContainSubstring(v1.LabelNodeExcludeBalancers + "=true"))
+							Expect(subnetID).To(Equal(nodeClass.Spec.Regions[0].VNETSubnetID))
+						} else {
+							Expect(claim.Annotations).ToNot(HaveKey(multiregion.PlacementAnnotation))
+							Expect(string(customData)).ToNot(ContainSubstring(v1.LabelNodeExcludeBalancers))
+							Expect(subnetID).To(Equal(testOptions.SubnetID))
+						}
+					}
+					Expect(launched).To(ConsistOf(regions))
+				}
+				It("should fill the home NodePool first and overflow to the other region at its limit", func() {
+					homePool.Spec.Limits = karpv1.Limits(v1.ResourceList{v1.ResourceCPU: resource.MustParse("2")})
+					ExpectApplied(ctx, env.Client, homeClass, homePool, nodeClass, nodePool)
+					pods := []*v1.Pod{podWithOwnNode(), podWithOwnNode()}
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pods...)
+					for _, pod := range pods {
+						ExpectScheduled(ctx, env.Client, pod)
+					}
+					expectLaunched(homePool, fake.Region)
+					expectLaunched(nodePool, fake.RegionNonZonal)
+				})
+				It("should overflow while the home region has no capacity and launch at home again once it has", func() {
+					ExpectApplied(ctx, env.Client, homeClass, homePool, nodeClass, nodePool)
+					for _, zone := range append(azureEnv.Zones(), zones.Regional) {
+						for _, capacityType := range []string{karpv1.CapacityTypeOnDemand, karpv1.CapacityTypeSpot} {
+							azureEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "ZonalAllocationFailure", defaultTestSKU, zone, capacityType)
+						}
+					}
+					overflowPod := podWithOwnNode()
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, overflowPod)
+					ExpectScheduled(ctx, env.Client, overflowPod)
+					expectLaunched(homePool)
+					expectLaunched(nodePool, fake.RegionNonZonal)
+
+					// Once the capacity failures expire, the next node launches in the home region again.
+					azureEnv.UnavailableOfferingsCache.Flush()
+					homePod := podWithOwnNode()
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, homePod)
+					ExpectScheduled(ctx, env.Client, homePod)
+					expectLaunched(homePool, fake.Region)
+					expectLaunched(nodePool, fake.RegionNonZonal)
+				})
+			})
 			It("should give VMs in other regions the identities and kubelet identity of their region", func() {
 				globalIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/global"
 				regionIdentity := "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/identities/providers/Microsoft.ManagedIdentity/userAssignedIdentities/remote"
