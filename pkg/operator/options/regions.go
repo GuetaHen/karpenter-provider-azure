@@ -29,6 +29,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/google/uuid"
 	"github.com/samber/lo"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 var regionNamePattern = regexp.MustCompile(`^[a-z][a-z0-9]{1,63}$`)
@@ -138,8 +139,13 @@ func validateMultiRegionTargets(regions []v1beta1.Region) error {
 // none) qualifies. Azure CNI Overlay routes its pod ranges only in the cluster VNet, and Azure CNI with
 // pod IPs from the node subnet depends on AKS-managed IP address management and masquerade rules that
 // are not verified for nodes in other regions.
+// With --multi-region-external-pod-network, Azure CNI Overlay is also supported: an external agent then
+// supplies the pod network of these nodes.
 func (o *Options) multiRegionNetworkSupported() bool {
-	return o.IsNetworkPluginNone() && o.NetworkPluginMode == ""
+	if o.IsNetworkPluginNone() && o.NetworkPluginMode == "" {
+		return true
+	}
+	return o.MultiRegionExternalPodNetwork && o.IsAzureCNIOverlay()
 }
 
 // MultiRegionNodeIdentity is the identity configuration of the VMs in one region.
@@ -182,6 +188,12 @@ func (o *Options) ValidateHomeLocation(home string) error {
 }
 
 func (o *Options) validateMultiRegionOptions() error {
+	if o.MultiRegionExternalPodNetwork && (!o.EnableMultiRegion || !o.IsAzureCNIOverlay()) {
+		return fmt.Errorf("multi-region-external-pod-network requires enable-multi-region with network-plugin azure and network-plugin-mode overlay")
+	}
+	if err := o.validatePodNetworkStartupTaint(); err != nil {
+		return err
+	}
 	if err := o.parseMultiRegionNodeIdentities(); err != nil {
 		return err
 	}
@@ -195,6 +207,21 @@ func (o *Options) validateMultiRegionOptions() error {
 		if err := validateMultiRegionNodeIdentity(region, o.MultiRegionNodeIdentities[region]); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validatePodNetworkStartupTaint accepts no key, or a taint key together with the external pod network.
+func (o *Options) validatePodNetworkStartupTaint() error {
+	key := o.MultiRegionPodNetworkStartupTaint
+	if key == "" {
+		return nil
+	}
+	if !o.MultiRegionExternalPodNetwork {
+		return fmt.Errorf("multi-region-pod-network-startup-taint requires multi-region-external-pod-network")
+	}
+	if errs := validation.IsQualifiedName(key); len(errs) > 0 {
+		return fmt.Errorf("multi-region-pod-network-startup-taint must be a taint key: %s", strings.Join(errs, "; "))
 	}
 	return nil
 }

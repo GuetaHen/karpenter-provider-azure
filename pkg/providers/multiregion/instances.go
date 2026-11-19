@@ -48,6 +48,9 @@ func (p *Instances) BeginCreate(ctx context.Context, nodeClass *v1beta1.AKSNodeC
 	if err := options.FromContext(ctx).ValidateRegions(nodeClass); err != nil {
 		return nil, err
 	}
+	if err := requirePodNetworkStartupTaint(nodeClaim, options.FromContext(ctx).MultiRegionPodNetworkStartupTaint); err != nil {
+		return nil, err
+	}
 	stored, err := p.readClaim(ctx, nodeClaim)
 	if err != nil {
 		return nil, err
@@ -60,6 +63,17 @@ func (p *Instances) BeginCreate(ctx context.Context, nodeClass *v1beta1.AKSNodeC
 		return nil, err
 	}
 	return p.launch(ctx, nodeClass, stored, types, placement)
+}
+
+// requirePodNetworkStartupTaint refuses a NodeClaim without the startup taint that the pod network agent
+// removes when the pod network of the node is ready. An empty key turns the check off.
+func requirePodNetworkStartupTaint(nodeClaim *karpv1.NodeClaim, key string) error {
+	if key == "" || lo.ContainsBy(nodeClaim.Spec.StartupTaints, func(taint corev1.Taint) bool {
+		return taint.Key == key && (taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute)
+	}) {
+		return nil
+	}
+	return fmt.Errorf("multi-region NodeClaims need the startup taint %s:NoSchedule, which the pod network agent removes when the pod network of the node is ready; add it to the startupTaints of the NodePool", key)
 }
 
 func (p *Instances) readClaim(ctx context.Context, nodeClaim *karpv1.NodeClaim) (*karpv1.NodeClaim, error) {

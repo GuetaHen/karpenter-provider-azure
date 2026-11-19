@@ -680,6 +680,110 @@ var _ = Describe("CloudProvider", func() {
 				Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(Equal(2), "retries must adopt the original VM")
 				Expect(azureEnv.LoadBalancersAPI.NewListPagerBehavior.CalledWithInput.Len()).To(BeZero())
 			})
+			Context("External pod network", func() {
+				BeforeEach(func() {
+					testOptions.NetworkPlugin, testOptions.NetworkPluginMode = consts.NetworkPluginAzure, consts.NetworkPluginModeOverlay
+					testOptions.MultiRegionExternalPodNetwork = true
+				})
+
+				It("should label a node in another region with its placement subnet and the cluster VNet GUID", func() {
+					testOptions.NetworkDataplane = consts.NetworkDataplaneCilium
+					// Overlay pod ranges are allocated in the cluster VNet, so a node in another region pairs the
+					// cluster VNet GUID with the name of the subnet that its NIC is in.
+					remoteSubnetID := fmt.Sprintf("/subscriptions/%s/resourceGroups/network-remote/providers/Microsoft.Network/virtualNetworks/remote-vnet/subnets/remote-nodes", azureEnv.SubscriptionID)
+					for i := range nodeClass.Spec.Regions {
+						if nodeClass.Spec.Regions[i].Name == fake.RegionNonZonal {
+							nodeClass.Spec.Regions[i].VNETSubnetID = remoteSubnetID
+						}
+					}
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+					customData, err := base64.StdEncoding.DecodeString(lo.FromPtr(input.VM.Properties.OSProfile.CustomData))
+					Expect(err).ToNot(HaveOccurred())
+					for _, label := range []string{
+						"kubernetes.azure.com/nodenetwork-vnetguid=" + testOptions.VnetGUID,
+						"kubernetes.azure.com/network-subnet=remote-nodes",
+						"kubernetes.azure.com/azure-cni-overlay=true",
+						"kubernetes.azure.com/podnetwork-type=overlay",
+						"kubernetes.azure.com/ebpf-dataplane=cilium",
+						v1.LabelNodeExcludeBalancers + "=true",
+					} {
+						Expect(string(customData)).To(ContainSubstring(label))
+					}
+					nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(nic.Properties.NetworkSecurityGroup).To(BeNil())
+					for _, config := range nic.Properties.IPConfigurations {
+						Expect(config.Properties.LoadBalancerBackendAddressPools).To(BeEmpty())
+						Expect(lo.FromPtr(config.Properties.Subnet.ID)).To(Equal(remoteSubnetID))
+					}
+				})
+
+				It("should forward IP packets on the NICs in every region of an AKSNodeClass with spec.regions", func() {
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pods := []*v1.Pod{
+						coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.Region, v1.LabelInstanceTypeStable: "Standard_D2_v3"}}),
+						coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}}),
+					}
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pods...)
+					var locations []string
+					for azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len() > 0 {
+						input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+						nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+						Expect(err).ToNot(HaveOccurred())
+						Expect(lo.FromPtr(nic.Properties.EnableIPForwarding)).To(BeTrue(), lo.FromPtr(nic.Location))
+						locations = append(locations, lo.FromPtr(nic.Location))
+					}
+					Expect(locations).To(ConsistOf(fake.Region, fake.RegionNonZonal))
+				})
+
+				It("should not forward IP packets on the NICs of an AKSNodeClass without spec.regions", func() {
+					nodeClass.Spec.Regions = nil
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod()
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					input := azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop()
+					nic, err := azureEnv.NetworkInterfacesAPI.Get(ctx, testOptions.NodeResourceGroup, input.VMName, nil)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(nic.Properties.EnableIPForwarding).To(HaveValue(BeFalse()))
+				})
+
+				DescribeTable("should refuse a NodeClaim without the pod network startup taint before any write",
+					func(taints []v1.Taint) {
+						const key = "karpenter.azure.com/regional-pod-network-not-ready"
+						testOptions.MultiRegionPodNetworkStartupTaint = key
+						nodePool.Spec.Template.Spec.StartupTaints = taints
+						ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+						pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+						ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+						ExpectNotScheduled(ctx, env.Client, pod)
+						Expect(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Len()).To(BeZero())
+						claims := &karpv1.NodeClaimList{}
+						Expect(env.Client.List(ctx, claims)).To(Succeed())
+						Expect(claims.Items).To(HaveLen(1))
+						Expect(claims.Items[0].Annotations).ToNot(HaveKey(multiregion.PlacementAnnotation))
+						_, err := cloudProvider.Create(ctx, &claims.Items[0])
+						Expect(err).To(MatchError(ContainSubstring(key)))
+					},
+					Entry("without startup taints", nil),
+					Entry("with a PreferNoSchedule taint of that key", []v1.Taint{{Key: "karpenter.azure.com/regional-pod-network-not-ready", Effect: v1.TaintEffectPreferNoSchedule}}),
+				)
+
+				It("should launch a NodeClaim that carries the pod network startup taint", func() {
+					testOptions.MultiRegionPodNetworkStartupTaint = "karpenter.azure.com/regional-pod-network-not-ready"
+					nodePool.Spec.Template.Spec.StartupTaints = []v1.Taint{{Key: testOptions.MultiRegionPodNetworkStartupTaint, Effect: v1.TaintEffectNoSchedule}}
+					ExpectApplied(ctx, env.Client, nodeClass, nodePool)
+					pod := coretest.UnschedulablePod(coretest.PodOptions{NodeSelector: map[string]string{v1.LabelTopologyRegion: fake.RegionNonZonal, v1.LabelInstanceTypeStable: "Standard_D2_v3"}})
+					ExpectProvisionedAndWaitForPromises(ctx, env.Client, cluster, cloudProvider, coreProvisioner, azureEnv, pod)
+					ExpectScheduled(ctx, env.Client, pod)
+					Expect(lo.FromPtr(azureEnv.VirtualMachinesAPI.VirtualMachineCreateOrUpdateBehavior.CalledWithInput.Pop().VM.Location)).To(Equal(fake.RegionNonZonal))
+				})
+			})
+
 			Context("Home-first NodePools", func() {
 				// One controller owns both NodePools. The home NodePool has the higher weight and an
 				// AKSNodeClass without spec.regions; the overflow NodePool lists only another region.
