@@ -385,3 +385,8 @@ peered in a full mesh. It then launches one node in each listed region from one
 NodePool, checks the location, subnet, load-balancer backend pools, network
 security group and IP forwarding of each VM and NIC in ARM, probes pod traffic
 between every two regions through cluster DNS, and deletes the nodes.
+
+## Options of this fork
+
+This fork adds options that the upstream provider does not have. They are off
+by default. See [Options of this fork](multi-region-fork.md).
