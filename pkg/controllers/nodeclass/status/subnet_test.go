@@ -18,6 +18,7 @@ package status_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -221,4 +222,71 @@ var _ = Describe("SubnetStatus", func() {
 			Expect(cond.Message).To(ContainSubstring(errString))
 		})
 	})
+
+	Context("Multi-region", func() {
+		BeforeEach(func() {
+			nodeClass = test.AKSNodeClass()
+			nodeClass.Spec.Regions = []v1beta1.Region{{
+				Name:         "westus2",
+				VNETSubnetID: "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes",
+			}}
+		})
+
+		It("should mark nodeclass as not ready and name a region whose SKU catalog has not loaded", func() {
+			reconciler := status.NewSubnetReconciler(nil, func(context.Context, *v1beta1.AKSNodeClass) error { return unloadedRegionError{} })
+			result, err := reconciler.Reconcile(ctx, nodeClass)
+			Expect(err).To(HaveOccurred(), "an error requeues with backoff until the region loads")
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			cond := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady)
+			Expect(cond.IsFalse()).To(BeTrue())
+			Expect(cond.Reason).To(Equal("MultiRegionCatalogUnavailable"))
+			Expect(cond.Message).To(ContainSubstring("westus2"))
+		})
+
+		It("should keep nodeclass ready and check again while other regions serve", func() {
+			reconciler := status.NewSubnetReconciler(nil, func(context.Context, *v1beta1.AKSNodeClass) error { return unavailableRegionsError{} })
+			result, err := reconciler.Reconcile(ctx, nodeClass)
+			Expect(err).ToNot(HaveOccurred(), "the other regions serve")
+			Expect(result).To(Equal(reconcile.Result{RequeueAfter: time.Minute * 3}), "the check repeats until the region passes")
+
+			cond := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady)
+			Expect(cond.IsTrue()).To(BeTrue())
+			Expect(cond.Reason).To(Equal("RegionsUnavailable"))
+			Expect(cond.Message).To(ContainSubstring("westus2"))
+		})
+
+		It("should mark nodeclass as not ready when no listed region passes its subnet check", func() {
+			reconciler := status.NewSubnetReconciler(nil, func(context.Context, *v1beta1.AKSNodeClass) error {
+				return errors.New("region westus2 subnet: subnet of a listed region must have a network security group")
+			})
+			result, err := reconciler.Reconcile(ctx, nodeClass)
+			Expect(err).To(HaveOccurred(), "an error requeues with backoff until a region passes")
+			Expect(result).To(Equal(reconcile.Result{}))
+
+			cond := nodeClass.StatusConditions().Get(v1beta1.ConditionTypeSubnetsReady)
+			Expect(cond.IsFalse()).To(BeTrue())
+			Expect(cond.Reason).To(Equal("MultiRegionSubnetInvalid"))
+			Expect(cond.Message).To(ContainSubstring("westus2"))
+		})
+	})
 })
+
+// unloadedRegionError and unavailableRegionsError stand in for the errors of the multi-region subnet check.
+type unloadedRegionError struct{}
+
+func (unloadedRegionError) Error() string {
+	return "region westus2 has no SKU catalog yet: SKU API unavailable"
+}
+
+func (unloadedRegionError) Reason() string { return "MultiRegionCatalogUnavailable" }
+
+type unavailableRegionsError struct{}
+
+func (unavailableRegionsError) Error() string {
+	return "regions without new nodes until their checks pass: region westus2 subnet: not found"
+}
+
+func (unavailableRegionsError) Reason() string { return "RegionsUnavailable" }
+
+func (unavailableRegionsError) UnavailableRegions() []string { return []string{"westus2"} }
