@@ -33,6 +33,11 @@ import (
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/instancetype"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/multiregion"
 )
 
 var (
@@ -76,3 +81,47 @@ var _ = Describe("getRequiredGVKs", func() {
 		Expect(gvks).To(ContainElement(object.GVK(&autoscalingv1beta1.CapacityBuffer{})))
 	})
 })
+
+var _ = Describe("withMultiRegionProviders", func() {
+	var images imagefamily.NodeImageProvider
+	var types instancetype.Provider
+	var vms instance.VMProvider
+
+	BeforeEach(func() {
+		images, types, vms = &fakeNodeImages{}, &fakeInstanceTypes{}, &fakeVMs{}
+	})
+
+	It("should not build the multi-region registry or wrappers when multi-region provisioning is disabled", func() {
+		disabledCtx := options.ToContext(ctx, &options.Options{})
+		regions, gotImages, gotTypes, gotVMs := withMultiRegionProviders(disabledCtx, images, types, vms, env.Client, func() *multiregion.Registry {
+			Fail("the multi-region registry must not be built when multi-region provisioning is disabled")
+			return nil
+		})
+		Expect(regions).To(BeNil())
+		Expect(gotImages).To(BeIdenticalTo(images))
+		Expect(gotTypes).To(BeIdenticalTo(types))
+		Expect(gotVMs).To(BeIdenticalTo(vms))
+		Expect((&Operator{MultiRegionProviders: regions}).MultiRegionSubnetValidator()).To(BeNil())
+	})
+
+	It("should wrap the home-region providers when multi-region provisioning is enabled", func() {
+		enabledCtx := options.ToContext(ctx, &options.Options{EnableMultiRegion: true})
+		registry := multiregion.New("eastus2", &multiregion.Providers{Types: types, Images: images, Instances: vms}, nil, nil)
+		builds := 0
+		regions, gotImages, gotTypes, gotVMs := withMultiRegionProviders(enabledCtx, images, types, vms, env.Client, func() *multiregion.Registry {
+			builds++
+			return registry
+		})
+		Expect(builds).To(Equal(1))
+		Expect(regions).To(BeIdenticalTo(registry))
+		Expect(gotImages).To(Equal(&multiregion.Images{NodeImageProvider: images, Registry: registry}))
+		Expect(gotTypes).To(Equal(&multiregion.InstanceTypes{Provider: types, Registry: registry}))
+		Expect(gotVMs).To(Equal(&multiregion.Instances{VMProvider: vms, Registry: registry, KubeClient: env.Client}))
+		Expect((&Operator{MultiRegionProviders: regions}).MultiRegionSubnetValidator()).ToNot(BeNil())
+	})
+})
+
+// The fakes embed their interface only to implement it; withMultiRegionProviders never calls them.
+type fakeNodeImages struct{ imagefamily.NodeImageProvider }
+type fakeInstanceTypes struct{ instancetype.Provider }
+type fakeVMs struct{ instance.VMProvider }

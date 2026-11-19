@@ -17,6 +17,7 @@ limitations under the License.
 package status_test
 
 import (
+	"context"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
@@ -31,11 +32,52 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/version"
+	kubernetesfake "k8s.io/client-go/kubernetes/fake"
+	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "sigs.k8s.io/karpenter/pkg/test/expectations"
 )
+
+type multiRegionTestImages struct{ images []imagefamily.NodeImage }
+
+func (p *multiRegionTestImages) List(context.Context, *v1beta1.AKSNodeClass) ([]imagefamily.NodeImage, error) {
+	return p.images, nil
+}
+
+func (p *multiRegionTestImages) GetLatestVersion(context.Context, *v1beta1.AKSNodeClass) (string, error) {
+	if len(p.images) == 0 {
+		return "", nil
+	}
+	return p.images[0].Version, nil
+}
+
+var _ = Describe("Multi-region image maintenance", func() {
+	It("should retain each region's version of the same image definition outside maintenance", func() {
+		nc := test.AKSNodeClass()
+		nc.StatusConditions().SetTrue(v1beta1.ConditionTypeImagesReady)
+		nc.Status.Images = []v1beta1.NodeImage{
+			{ID: "gallery/image/versions/1", Requirements: []corev1.NodeSelectorRequirement{{Key: corev1.LabelTopologyRegion, Operator: corev1.NodeSelectorOpIn, Values: []string{"eastus2"}}}},
+			{ID: "gallery/image/versions/2", Requirements: []corev1.NodeSelectorRequirement{{Key: corev1.LabelTopologyRegion, Operator: corev1.NodeSelectorOpIn, Values: []string{"westus2"}}}},
+		}
+		expected := nc.DeepCopy().Status.Images
+		provider := &multiRegionTestImages{images: []imagefamily.NodeImage{
+			{ID: "gallery/image/versions/3", Requirements: scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "eastus2"))},
+			{ID: "gallery/image/versions/4", Requirements: scheduling.NewRequirements(scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "westus2"))},
+		}}
+		kube := kubernetesfake.NewClientset(&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "upcoming-maintenance-window", Namespace: "kube-system"},
+			Data: map[string]string{
+				"aksManagedNodeOSUpgradeSchedule-start": time.Now().Add(time.Hour).Format(time.RFC3339),
+				"aksManagedNodeOSUpgradeSchedule-end":   time.Now().Add(2 * time.Hour).Format(time.RFC3339),
+			},
+		})
+		_, err := status.NewNodeImageReconciler(provider, kube, "kube-system").Reconcile(ctx, nc)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(nc.Status.Images).To(Equal(expected))
+	})
+})
 
 const (
 	oldcigImageVersion   = "202410.09.0"

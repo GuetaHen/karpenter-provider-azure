@@ -76,11 +76,12 @@ func NewControllers(
 	parsedDiskEncryptionSetID *arm.ResourceID,
 	networkPolicy string,
 	networkPlugin string,
+	validateRegions ...func(context.Context, *v1beta1.AKSNodeClass) error,
 ) []controller.Controller {
 	controllers := []controller.Controller{
 		nodeclasshash.NewController(kubeClient),
 		nodeclassstatus.NewController(kubeClient, subscriptionID, location, kubernetesVersionProvider, nodeImageProvider, inClusterKubernetesInterface, managedKubernetesInterface, managedDynamicInterface, subnetsClient, diskEncryptionSetsClient, parsedDiskEncryptionSetID, networkPolicy, networkPlugin,
-			capacityReservationGroupsClient, capacityReservationsClient, instanceTypesProvider, unavailableOfferings, options.FromContext(ctx).SystemNamespace),
+			capacityReservationGroupsClient, capacityReservationsClient, instanceTypesProvider, unavailableOfferings, options.FromContext(ctx).SystemNamespace, validateRegions...),
 		nodeclasstermination.NewController(kubeClient, recorder),
 
 		nodeclaimgarbagecollection.NewInstance(kubeClient, cloudProvider, clk),

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/cloud"
@@ -42,6 +43,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/transport"
 	"k8s.io/client-go/util/flowcontrol"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpapis "sigs.k8s.io/karpenter/pkg/apis"
@@ -69,6 +71,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/kubernetesversion"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/loadbalancer"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/multiregion"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/networksecuritygroup"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/pricing"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/quota"
@@ -102,7 +105,8 @@ type Operator struct {
 	LaunchTemplateProvider    *launchtemplate.Provider
 	PricingProvider           *pricing.Provider
 	InstanceTypesProvider     instancetype.Provider
-	VMInstanceProvider        *instance.DefaultVMProvider
+	VMInstanceProvider        instance.VMProvider
+	MultiRegionProviders      *multiregion.Registry
 	AKSMachineProvider        *instance.DefaultAKSMachineProvider
 	LoadBalancerProvider      *loadbalancer.Provider
 	QuotaProvider             *quota.DefaultProvider
@@ -301,18 +305,67 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		quotaProvider,
 	)
 
+	// Multi-region provisioning is opt-in. When it is disabled, no multi-region registry,
+	// wrapper, ARM client or cache is constructed and the home-region providers are used
+	// directly, exactly as before the feature existed.
+	regions, wrappedImages, wrappedTypes, wrappedVMs := withMultiRegionProviders(ctx, imageProvider, instanceTypeProvider, vmInstanceProvider, operator.GetClient(), func() *multiregion.Registry {
+		multiRegionNetworkValidator := sync.OnceValues(func() (*multiregion.NetworkValidator, error) {
+			virtualNetworks, err := armnetwork.NewVirtualNetworksClient(azConfig.SubscriptionID, cred, armopts.DefaultARMOpts(env.Cloud, options.FromContext(ctx).EnableAzureSDKLogging))
+			if err != nil {
+				return nil, fmt.Errorf("creating VNet client for other regions: %w", err)
+			}
+			return &multiregion.NetworkValidator{
+				SubscriptionID: azConfig.SubscriptionID, VirtualNetworks: virtualNetworks, Subnets: azClient.SubnetsClient(),
+			}, nil
+		})
+		return multiregion.New(azConfig.Location, &multiregion.Providers{
+			Types: instanceTypeProvider, Images: imageProvider, Instances: vmInstanceProvider, Quota: quotaProvider,
+		}, func(location string) *multiregion.Providers {
+			// Region-scoped providers own independent caches. Subscription-scoped ARM
+			// clients are shared; no mutable operator options are changed for a launch.
+			unavailable := azurecache.NewUnavailableOfferings()
+			prices := pricing.NewProvider(ctx, env, pricing.NewAPI(env.Cloud), location, operator.Elected())
+			quotas := quota.NewProvider(azClient.UsageClient, azClient.QuotaCategoryVMFamilyMappingClient, location, operator.Clock)
+			types := instancetype.NewDefaultProvider(location,
+				cache.New(instancetype.InstanceTypesCacheTTL, azurecache.DefaultCleanupInterval),
+				azClient.SKUClient, prices, unavailable, quotas, operator.Clock)
+			images := imagefamily.NewProvider(azClient.ImageVersionsClient, location, azConfig.SubscriptionID,
+				azClient.NodeImageVersionsClient, cache.New(imagefamily.ImageExpirationInterval, imagefamily.ImageCacheCleaningInterval), operator.Clock)
+			resolver := imagefamily.NewDefaultResolver(operator.GetClient(), images, types, azClient.NodeBootstrappingClient)
+			templates := launchtemplate.NewProvider(ctx, resolver, images, networkSecurityGroupProvider,
+				lo.Must(getCABundle(operator.GetConfig())), options.FromContext(ctx).ClusterEndpoint,
+				azConfig.TenantID, azConfig.SubscriptionID, azConfig.ResourceGroup, options.FromContext(ctx).KubeletIdentityClientID,
+				options.FromContext(ctx).NodeResourceGroup, location, options.FromContext(ctx).ProvisionMode)
+			// Cross-region selection uses the existing price/capacity ranker, not
+			// a home-region placement-score request or fabricated per-region prices.
+			allocator := allocationstrategy.NewProvider(nil, consts.ComputeRecommendationModeDisabled)
+			instances := instance.NewDefaultVMProvider(azClient, types, allocator, templates,
+				loadBalancerProvider, networkSecurityGroupProvider, unavailable, location,
+				options.FromContext(ctx).NodeResourceGroup, azConfig.SubscriptionID, options.FromContext(ctx).ProvisionMode,
+				options.FromContext(ctx).DiskEncryptionSetID, env, quotas)
+			return &multiregion.Providers{Types: types, Images: images, Instances: instances, Quota: quotas}
+		}, func(ctx context.Context, region v1beta1.Region) error {
+			validator, err := multiRegionNetworkValidator()
+			if err != nil {
+				return err
+			}
+			return validator.Validate(ctx, region)
+		}).WithClock(operator.Clock).WithKubeClient(operator.GetClient())
+	})
+
 	return ctx, &Operator{
 		Operator:                     operator,
 		InClusterKubernetesInterface: inClusterClient,
 		ManagedDynamicInterface:      managedDynamicClient,
 		UnavailableOfferingsCache:    unavailableOfferingsCache,
 		KubernetesVersionProvider:    kubernetesVersionProvider,
-		ImageProvider:                imageProvider,
+		ImageProvider:                wrappedImages,
 		ImageResolver:                imageResolver,
 		LaunchTemplateProvider:       launchTemplateProvider,
 		PricingProvider:              pricingProvider,
-		InstanceTypesProvider:        instanceTypeProvider,
-		VMInstanceProvider:           vmInstanceProvider,
+		InstanceTypesProvider:        wrappedTypes,
+		VMInstanceProvider:           wrappedVMs,
+		MultiRegionProviders:         regions,
 		AKSMachineProvider:           aksMachineInstanceProvider,
 		LoadBalancerProvider:         loadBalancerProvider,
 		QuotaProvider:                quotaProvider,
@@ -321,6 +374,30 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		Location:                     azConfig.Location,
 		Cloud:                        env.Cloud,
 	}
+}
+
+// MultiRegionSubnetValidator returns nil when multi-region provisioning is disabled, so the
+// subnet status reconciler reports multi-region NodeClasses as disabled instead of validating them.
+func (op *Operator) MultiRegionSubnetValidator() func(context.Context, *v1beta1.AKSNodeClass) error {
+	if op.MultiRegionProviders == nil {
+		return nil
+	}
+	return op.MultiRegionProviders.ValidateSubnets
+}
+
+// withMultiRegionProviders returns the home-region providers unchanged and no registry when
+// multi-region provisioning is disabled, without calling newRegistry. When it is enabled, it
+// returns the registry that newRegistry builds and wrappers that serve AKSNodeClasses without
+// spec.regions from the home-region providers and those with spec.regions from the registry.
+func withMultiRegionProviders(ctx context.Context, images imagefamily.NodeImageProvider, types instancetype.Provider, vms instance.VMProvider,
+	kubeClient client.Client, newRegistry func() *multiregion.Registry) (*multiregion.Registry, imagefamily.NodeImageProvider, instancetype.Provider, instance.VMProvider) {
+	if !options.FromContext(ctx).EnableMultiRegion {
+		return nil, images, types, vms
+	}
+	regions := newRegistry()
+	return regions, &multiregion.Images{NodeImageProvider: images, Registry: regions},
+		&multiregion.InstanceTypes{Provider: types, Registry: regions},
+		&multiregion.Instances{VMProvider: vms, Registry: regions, KubeClient: kubeClient}
 }
 
 func GetAZConfig() (*auth.Config, error) {

@@ -33,20 +33,41 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
 )
 
-type SubnetReconciler struct {
-	subnetClient azapi.SubnetsAPI
+// reasonedError carries its own status condition reason.
+type reasonedError interface {
+	error
+	Reason() string
 }
 
-func NewSubnetReconciler(subnetClient azapi.SubnetsAPI) *SubnetReconciler {
-	return &SubnetReconciler{
+// partialRegionsError names regions that get no new nodes while the NodeClass's other regions serve.
+type partialRegionsError interface {
+	reasonedError
+	UnavailableRegions() []string
+}
+
+type SubnetReconciler struct {
+	subnetClient    azapi.SubnetsAPI
+	validateRegions func(context.Context, *v1beta1.AKSNodeClass) error
+}
+
+func NewSubnetReconciler(subnetClient azapi.SubnetsAPI, validateRegions ...func(context.Context, *v1beta1.AKSNodeClass) error) *SubnetReconciler {
+	r := &SubnetReconciler{
 		subnetClient: subnetClient,
 	}
+	if len(validateRegions) > 0 {
+		r.validateRegions = validateRegions[0]
+	}
+	return r
 }
 
 const (
 	SubnetUnreadyReasonNotFound     = "SubnetNotFound"
 	SubnetUnreadyReasonIDInvalid    = "SubnetIDInvalid"
 	SubnetUnreadyReasonUnknownError = "SubnetUnknownError"
+
+	// SubnetUnreadyReasonMultiRegionInvalid is the reason while no listed region of an
+	// AKSNodeClass with spec.regions passes its subnet check.
+	SubnetUnreadyReasonMultiRegionInvalid = "MultiRegionSubnetInvalid"
 )
 
 const (
@@ -58,6 +79,28 @@ const (
 )
 
 func (r *SubnetReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
+	if len(nodeClass.Spec.Regions) > 0 {
+		if r.validateRegions == nil {
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, options.ReasonMultiRegionDisabled, "spec.regions requires the controller option --enable-multi-region (ENABLE_MULTI_REGION=true)")
+			return reconcile.Result{}, nil
+		}
+		if err := r.validateRegions(ctx, nodeClass); err != nil {
+			// Some regions failed while the others serve: the NodeClass stays ready, and the check
+			// repeats so that the failing regions return once they pass.
+			if partial, ok := lo.ErrorsAs[partialRegionsError](err); ok {
+				nodeClass.StatusConditions().SetTrueWithReason(v1beta1.ConditionTypeSubnetsReady, partial.Reason(), err.Error())
+				return reconcile.Result{RequeueAfter: healthyRequeueInterval}, nil
+			}
+			reason := SubnetUnreadyReasonMultiRegionInvalid
+			if reasoned, ok := lo.ErrorsAs[reasonedError](err); ok {
+				reason = reasoned.Reason()
+			}
+			nodeClass.StatusConditions().SetFalse(v1beta1.ConditionTypeSubnetsReady, reason, err.Error())
+			return reconcile.Result{}, err
+		}
+		nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeSubnetsReady)
+		return reconcile.Result{RequeueAfter: healthyRequeueInterval}, nil
+	}
 	// TODO: Handle podSubnetID readiness here as well
 	return r.validateVNETSubnetID(ctx, nodeClass)
 }
