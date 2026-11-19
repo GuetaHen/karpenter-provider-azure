@@ -28,3 +28,8 @@ func (o *Options) SetMultiRegionNodeIdentitiesJSON(raw string) {
 func (o *Options) ValidateMultiRegionOptions() error {
 	return o.validateMultiRegionOptions()
 }
+
+// ValidateCoexistence exposes the coexistence option validation to tests.
+func (o *Options) ValidateCoexistence() error {
+	return o.validateCoexistence()
+}

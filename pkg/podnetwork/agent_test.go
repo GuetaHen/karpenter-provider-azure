@@ -406,7 +406,7 @@ func TestRegionalLaunch(t *testing.T) {
 	g.Expect(c.regionalLaunch(regionalNode, []karpv1.NodeClaim{*upper})).To(BeTrue())
 
 	for name, change := range map[string]func(claim *karpv1.NodeClaim, node *corev1.Node){
-		"a NodeClaim of another group":     func(claim *karpv1.NodeClaim, _ *corev1.Node) { claim.Spec.NodeClassRef.Group = "example.com" },
+		"a NodeClaim of another group":     func(claim *karpv1.NodeClaim, _ *corev1.Node) { claim.Spec.NodeClassRef.Group = "karpenter.azure.com" },
 		"a NodeClaim without a node class": func(claim *karpv1.NodeClaim, _ *corev1.Node) { claim.Spec.NodeClassRef = nil },
 		"a NodeClaim without a placement":  func(claim *karpv1.NodeClaim, _ *corev1.Node) { delete(claim.Annotations, PlacementAnnotation) },
 		"a NodeClaim of another VM":        func(claim *karpv1.NodeClaim, _ *corev1.Node) { claim.Status.ProviderID += "0" },

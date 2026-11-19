@@ -94,6 +94,14 @@ func NewController(
 	}
 }
 
+// WithNodeClassReader lets coexistence mode check whether an AKSNodeClass of the default API group
+// has the name of one of this controller's classes. Pass an uncached reader, such as the manager's
+// API reader, so that the check needs only get permission on that group's AKSNodeClasses.
+func (c *Controller) WithNodeClassReader(reader client.Reader) *Controller {
+	c.validation.WithNodeClassReader(reader)
+	return c
+}
+
 func (c *Controller) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, "nodeclass.status")
 

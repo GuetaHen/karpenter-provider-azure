@@ -20,6 +20,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/Azure/karpenter-provider-azure/pkg/apis"
 )
 
 const (
@@ -28,7 +30,7 @@ const (
 )
 
 var (
-	SchemeGroupVersion = schema.GroupVersion{Group: Group, Version: "v1beta1"}
+	SchemeGroupVersion = schema.GroupVersion{Group: apis.APIGroup, Version: "v1beta1"}
 	SchemeBuilder      = runtime.NewSchemeBuilder(func(scheme *runtime.Scheme) error {
 		scheme.AddKnownTypes(SchemeGroupVersion,
 			&AKSNodeClass{},

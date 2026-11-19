@@ -176,7 +176,7 @@ spec:
             - name: NODE_RESOURCE_GROUP_ID
               value: {{ required "podNetworkAgent.nodeResourceGroupID is required" $agent.nodeResourceGroupID | quote }}
             - name: NODE_CLASS_GROUP
-              value: "karpenter.azure.com"
+              value: {{ include "karpenter.aksNodeClassGroup" . | quote }}
             - name: TRANSIT_PREFIX
               value: {{ $agent.transitPrefix | quote }}
             - name: STARTUP_TAINT_KEY

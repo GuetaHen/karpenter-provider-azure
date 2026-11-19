@@ -28,7 +28,7 @@ import (
 )
 
 func init() {
-	gv := schema.GroupVersion{Group: apis.Group, Version: "v1beta1"}
+	gv := schema.GroupVersion{Group: apis.APIGroup, Version: "v1beta1"}
 	corev1.AddToGroupVersion(scheme.Scheme, gv)
 	scheme.Scheme.AddKnownTypes(gv,
 		&AKSNodeClass{},

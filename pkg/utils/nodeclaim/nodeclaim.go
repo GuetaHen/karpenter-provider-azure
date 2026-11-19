@@ -29,6 +29,7 @@ import (
 
 	armcompute "github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v7"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/coexistence"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
 	"github.com/Azure/karpenter-provider-azure/pkg/utils"
@@ -44,8 +45,19 @@ func UsingAKSNodeClassPredicate() predicate.Funcs {
 		if nodeClaim.Spec.NodeClassRef == nil {
 			return false
 		}
-		return nodeClaim.Spec.NodeClassRef.Kind == v1beta1.AKSNodeClassKind
+		return nodeClaim.Spec.NodeClassRef.Kind == v1beta1.AKSNodeClassKind && !IsForeignNodeClassRef(nodeClaim.Spec.NodeClassRef)
 	})
+}
+
+// IsForeignNodeClassRef reports whether a node class reference belongs to another controller.
+// Only coexistence mode tells API groups apart: there, a reference to anything but the
+// AKSNodeClass API this process serves is foreign. Outside coexistence mode it returns false,
+// so the existing selection is unchanged.
+func IsForeignNodeClassRef(ref *karpv1.NodeClassReference) bool {
+	if !coexistence.Enabled() {
+		return false
+	}
+	return ref == nil || ref.Kind != v1beta1.AKSNodeClassKind || ref.Group != apis.APIGroup
 }
 
 // GetAKSNodeClass resolves the AKSNodeClass from the NodeClaim's NodeClassRef.
@@ -61,7 +73,7 @@ func GetAKSNodeClass(ctx context.Context, kubeClient client.Client, nodeClaim *k
 	}
 
 	if !nodeClass.DeletionTimestamp.IsZero() {
-		return nil, utils.NewTerminatingResourceError(schema.GroupResource{Group: apis.Group, Resource: "aksnodeclasses"}, nodeClass.Name)
+		return nil, utils.NewTerminatingResourceError(schema.GroupResource{Group: apis.APIGroup, Resource: "aksnodeclasses"}, nodeClass.Name)
 	}
 
 	return nodeClass, nil

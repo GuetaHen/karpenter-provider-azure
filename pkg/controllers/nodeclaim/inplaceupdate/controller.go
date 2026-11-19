@@ -19,6 +19,7 @@ package inplaceupdate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -41,6 +42,7 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/instance"
+	"github.com/Azure/karpenter-provider-azure/pkg/providers/launchtemplate"
 	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
 )
 
@@ -49,6 +51,9 @@ type Controller struct {
 	vmInstanceProvider         instance.VMProvider
 	aksMachineInstanceProvider instance.AKSMachineProvider
 }
+
+// errVMNotOwned reports, in coexistence mode, a VM without this controller's owner tag.
+var errVMNotOwned = errors.New("virtual machine was not created by this controller")
 
 func NewController(
 	kubeClient client.Client,
@@ -65,6 +70,11 @@ func NewController(
 func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim) (reconcile.Result, error) {
 	ctx = injection.WithControllerName(ctx, "nodeclaim.inplaceupdate")
 	// No need to add nodeClaim name to the context as it's already there
+
+	// In coexistence mode, NodeClaims of another controller's node class are never updated.
+	if nodeclaimutils.IsForeignNodeClassRef(nodeClaim.Spec.NodeClassRef) {
+		return reconcile.Result{}, nil
+	}
 
 	// Get the NodeClass
 	nodeClass, err := nodeclaimutils.GetAKSNodeClass(ctx, c.kubeClient, nodeClaim)
@@ -97,18 +107,8 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 
 	stored := nodeClaim.DeepCopy()
 
-	if aksMachineName, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
-		// AKS machine-based nodeClaim
-		err := c.processAKSMachineInstance(ctx, options, nodeClaim, nodeClass, aksMachineName)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("processing AKS machine instance for nodeClaim %s: %w", nodeClaim.Name, err)
-		}
-	} else {
-		// VM-based nodeClaim
-		err := c.processVMInstance(ctx, options, nodeClaim, nodeClass)
-		if err != nil {
-			return reconcile.Result{}, fmt.Errorf("processing VM instance for nodeClaim %s: %w", nodeClaim.Name, err)
-		}
+	if updated, err := c.processInstance(ctx, options, nodeClaim, nodeClass); err != nil || !updated {
+		return reconcile.Result{}, err
 	}
 
 	if nodeClaim.Annotations == nil {
@@ -123,6 +123,26 @@ func (c *Controller) Reconcile(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 
 	return reconcile.Result{}, nil
+}
+
+// processInstance brings the nodeClaim's VM or AKS machine to the goal state. It reports false,
+// without an error, for a VM without this controller's owner tag, which is never updated.
+func (c *Controller) processInstance(ctx context.Context, opts *options.Options, nodeClaim *karpv1.NodeClaim, nodeClass *v1beta1.AKSNodeClass) (bool, error) {
+	if aksMachineName, isAKSMachine := instance.GetAKSMachineNameFromNodeClaim(nodeClaim); isAKSMachine {
+		if err := c.processAKSMachineInstance(ctx, opts, nodeClaim, nodeClass, aksMachineName); err != nil {
+			return false, fmt.Errorf("processing AKS machine instance for nodeClaim %s: %w", nodeClaim.Name, err)
+		}
+		return true, nil
+	}
+	err := c.processVMInstance(ctx, opts, nodeClaim, nodeClass)
+	if errors.Is(err, errVMNotOwned) {
+		log.FromContext(ctx).Info("skipping in-place update of a virtual machine without this controller's owner tag", "providerID", nodeClaim.Status.ProviderID)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("processing VM instance for nodeClaim %s: %w", nodeClaim.Name, err)
+	}
+	return true, nil
 }
 
 func (c *Controller) shouldProcess(ctx context.Context, nodeClaim *karpv1.NodeClaim) (bool, reconcile.Result) {
@@ -153,6 +173,9 @@ func (c *Controller) processVMInstance(
 	vm, err := nodeclaimutils.GetVM(ctx, c.vmInstanceProvider, nodeClaim)
 	if err != nil {
 		return fmt.Errorf("getting VM for nodeClaim %s: %w", nodeClaim.Name, err)
+	}
+	if !launchtemplate.IsOwned(vm.Tags) {
+		return errVMNotOwned
 	}
 
 	err = c.applyVMPatch(ctx, options, nodeClaim, nodeClass, vm)

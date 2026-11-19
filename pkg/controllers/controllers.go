@@ -81,7 +81,7 @@ func NewControllers(
 	controllers := []controller.Controller{
 		nodeclasshash.NewController(kubeClient),
 		nodeclassstatus.NewController(kubeClient, subscriptionID, location, kubernetesVersionProvider, nodeImageProvider, inClusterKubernetesInterface, managedKubernetesInterface, managedDynamicInterface, subnetsClient, diskEncryptionSetsClient, parsedDiskEncryptionSetID, networkPolicy, networkPlugin,
-			capacityReservationGroupsClient, capacityReservationsClient, instanceTypesProvider, unavailableOfferings, options.FromContext(ctx).SystemNamespace, validateRegions...),
+			capacityReservationGroupsClient, capacityReservationsClient, instanceTypesProvider, unavailableOfferings, options.FromContext(ctx).SystemNamespace, validateRegions...).WithNodeClassReader(mgr.GetAPIReader()),
 		nodeclasstermination.NewController(kubeClient, recorder),
 
 		nodeclaimgarbagecollection.NewInstance(kubeClient, cloudProvider, clk),

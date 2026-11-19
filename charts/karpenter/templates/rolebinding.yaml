@@ -57,3 +57,25 @@ subjects:
   - kind: ServiceAccount
     name: {{ template "karpenter.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
+{{- if or (not .Values.webhook.enabled) .Values.settings.systemNamespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "karpenter.fullname" . }}-maintenance-window
+  namespace: {{ include "karpenter.systemNamespace" . }}
+  labels:
+    {{- include "karpenter.labels" . | nindent 4 }}
+  {{- with .Values.additionalAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "karpenter.fullname" . }}-maintenance-window
+subjects:
+  - kind: ServiceAccount
+    name: {{ template "karpenter.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

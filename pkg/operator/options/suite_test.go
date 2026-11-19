@@ -203,6 +203,18 @@ var _ = Describe("Multi-region configuration", func() {
 	})
 })
 
+var _ = Describe("Coexistence mode", func() {
+	It("rejects AKS machine modes in coexistence mode", func() {
+		opts := &options.Options{CoexistenceMode: true, ProvisionMode: consts.ProvisionModeAKSMachineAPI}
+		Expect(opts.ValidateCoexistence()).To(MatchError(ContainSubstring("COEXISTENCE_MODE")))
+		opts.ProvisionMode, opts.ManageExistingAKSMachines = consts.ProvisionModeAKSScriptless, true
+		Expect(opts.ValidateCoexistence()).To(HaveOccurred())
+		opts.ManageExistingAKSMachines = false
+		Expect(opts.ValidateCoexistence()).To(Succeed())
+		Expect(options.ValidateCoexistenceFeatureGates(true)).To(Succeed(), "the feature gates are restricted only in coexistence mode")
+	})
+})
+
 var _ = Describe("Community gallery FIPS images option", func() {
 	parse := func(args ...string) *options.Options {
 		fs := &coreoptions.FlagSet{FlagSet: flag.NewFlagSet("karpenter", flag.ContinueOnError)}

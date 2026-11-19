@@ -135,14 +135,14 @@ render "${agent[@]}" --set podNetworkAgent.admissionPolicy.enabled=false >"$tmp_
     fail "expected no admission policy with podNetworkAgent.admissionPolicy.enabled=false"
 
 render "${agent[@]}" --set podNetworkAgent.image.digest="$digest" --set 'podNetworkAgent.command={/usr/local/bin/pod-network-agent}' \
-    --set podNetworkAgent.apiServer.host=cluster.example.com \
+    --set podNetworkAgent.apiServer.host=cluster.example.com --set coexistence.enabled=true --set webhook.enabled=false \
     --set podNetworkAgent.maxUnavailable=10% >"$tmp_dir/options.yaml"
 agent_object "$tmp_dir/options.yaml" DaemonSet | jq -e --arg image "example.com/pod-network-agent:v0.0.0@$digest" '
     .spec.updateStrategy.rollingUpdate == {"maxSurge": 0, "maxUnavailable": "10%"}
     and (.spec.template.spec.containers[0] | .image == $image and .command == ["/usr/local/bin/pod-network-agent"]
-    and ([.env[] | {(.name): .value}] | add | .NODE_CLASS_GROUP == "karpenter.azure.com"
+    and ([.env[] | {(.name): .value}] | add | .NODE_CLASS_GROUP == "multiregion.io"
         and .KUBERNETES_SERVICE_HOST == "cluster.example.com" and .KUBERNETES_SERVICE_PORT == "443"))' >/dev/null ||
-    fail "expected maxUnavailable, the image digest, the command, the API server and the node class group"
+    fail "expected maxUnavailable, the image digest, the command, the API server and the node class group of coexistence mode"
 render "${agent[@]}" --set podNetworkAgent.image.tag= --set podNetworkAgent.image.digest="$digest" >"$tmp_dir/digest.yaml"
 [[ "$(agent_object "$tmp_dir/digest.yaml" DaemonSet | jq -r '.spec.template.spec.containers[0].image')" == "example.com/pod-network-agent@$digest" ]] ||
     fail "expected an image by digest alone"

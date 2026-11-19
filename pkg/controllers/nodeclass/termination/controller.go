@@ -25,6 +25,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
+	nodeclaimutils "github.com/Azure/karpenter-provider-azure/pkg/utils/nodeclaim"
 	"github.com/samber/lo"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/types"
@@ -74,8 +75,12 @@ func (c *Controller) finalize(ctx context.Context, nodeClass *v1beta1.AKSNodeCla
 	if err := c.kubeClient.List(ctx, nodeClaimList, client.MatchingFields{"spec.nodeClassRef.name": nodeClass.Name}); err != nil {
 		return reconcile.Result{}, fmt.Errorf("listing nodeclaims that are using nodeclass, %w", err)
 	}
-	if len(nodeClaimList.Items) > 0 {
-		c.recorder.Publish(WaitingOnNodeClaimTerminationEvent(nodeClass, lo.Map(nodeClaimList.Items, func(nc karpv1.NodeClaim, _ int) string { return nc.Name })))
+	// The name index also matches NodeClaims of another controller's node class.
+	nodeClaims := lo.Reject(nodeClaimList.Items, func(nc karpv1.NodeClaim, _ int) bool {
+		return nodeclaimutils.IsForeignNodeClassRef(nc.Spec.NodeClassRef)
+	})
+	if len(nodeClaims) > 0 {
+		c.recorder.Publish(WaitingOnNodeClaimTerminationEvent(nodeClass, lo.Map(nodeClaims, func(nc karpv1.NodeClaim, _ int) string { return nc.Name })))
 		return reconcile.Result{RequeueAfter: time.Minute * 10}, nil // periodically fire the event
 	}
 
@@ -106,7 +111,7 @@ func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 			&karpv1.NodeClaim{},
 			handler.EnqueueRequestsFromMapFunc(func(_ context.Context, o client.Object) []reconcile.Request {
 				nc := o.(*karpv1.NodeClaim)
-				if nc.Spec.NodeClassRef == nil {
+				if nc.Spec.NodeClassRef == nil || nodeclaimutils.IsForeignNodeClassRef(nc.Spec.NodeClassRef) {
 					return nil
 				}
 				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: nc.Spec.NodeClassRef.Name}}}

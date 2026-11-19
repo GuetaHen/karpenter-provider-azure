@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/coexistence"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/google/uuid"
@@ -183,6 +184,30 @@ func (o *Options) regionIdentity(location string) (MultiRegionNodeIdentity, bool
 func (o *Options) ValidateHomeLocation(home string) error {
 	if _, ok := o.regionIdentity(home); ok {
 		return fmt.Errorf("multi-region-node-identities must not contain the cluster region %q", strings.ToLower(home))
+	}
+	return nil
+}
+
+// ValidateCoexistenceFeatureGates rejects, in coexistence mode, the CapacityBuffer feature: both
+// controllers would provision for the same CapacityBuffers and write their status. NodeOverlay is
+// allowed because the operator keeps the core controllers from writing NodeOverlay status.
+func ValidateCoexistenceFeatureGates(capacityBuffer bool) error {
+	if coexistence.Enabled() && capacityBuffer {
+		return fmt.Errorf("%s=true requires the CapacityBuffer feature gate to be disabled, because both controllers would reconcile CapacityBuffers", coexistence.EnvVar)
+	}
+	return nil
+}
+
+func coexistenceEnabled() bool {
+	return coexistence.Enabled()
+}
+
+func (o *Options) validateCoexistence() error {
+	if err := coexistence.Err(); err != nil {
+		return err
+	}
+	if o.CoexistenceMode && (o.IsAKSMachineAPIMode() || o.ManageExistingAKSMachines) {
+		return fmt.Errorf("%s=true does not support AKS Machine API provision modes or manage-existing-aks-machines", coexistence.EnvVar)
 	}
 	return nil
 }

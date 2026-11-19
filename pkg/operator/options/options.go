@@ -146,6 +146,9 @@ type Options struct {
 	// in the keyed regions. Keys are lowercase region names. Requires EnableMultiRegion.
 	MultiRegionNodeIdentities     map[string]MultiRegionNodeIdentity `json:"multiRegionNodeIdentities,omitempty"`
 	multiRegionNodeIdentitiesJSON string
+	// CoexistenceMode mirrors COEXISTENCE_MODE. That variable is read once at process start,
+	// because it selects the API group AKSNodeClass registers under, so there is no flag.
+	CoexistenceMode bool `json:"coexistenceMode,omitempty"`
 
 	AKSMachinesPoolName       string        `json:"aksMachinesPoolName,omitempty"`       // The name of the agent pool for the AKS machine API, assuming that all machines belong to the same agent pool. Only used on AKS machine API provision modes.
 	ProviderBatchIdleDuration time.Duration `json:"providerBatchIdleDuration,omitempty"` // Idle duration for provider batch accumulation (default 1s). Only used on provision mode aksmachineapiheaderbatch.
@@ -207,6 +210,7 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 // LoadFromEnvironment loads options that are intentionally not exposed as command-line flags.
 func (o *Options) LoadFromEnvironment() {
 	o.SystemNamespace = strings.TrimSpace(os.Getenv("SYSTEM_NAMESPACE"))
+	o.CoexistenceMode = coexistenceEnabled()
 }
 
 // IsAKSMachineAPIMode returns true if the current provision mode creates instances via the AKS Machine API.

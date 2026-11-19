@@ -33,7 +33,7 @@ import (
 )
 
 const (
-	testGroup           = "karpenter.azure.com"
+	testGroup           = "multiregion.io"
 	testResourceGroupID = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/cluster-nodes"
 	testSubnetID        = "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/nodes/subnets/nodes"
 )
@@ -221,8 +221,8 @@ func TestEvaluateRejectsNodesThatFailACheck(t *testing.T) {
 		"no NodeClaim":   {func(cl *cluster) { cl.claims = nil }, "0 NodeClaims instead of one"},
 		"two NodeClaims": {func(cl *cluster) { cl.claims = append(cl.claims, cl.claims[0]) }, "2 NodeClaims instead of one"},
 		"a NodeClaim of the other installation": {func(cl *cluster) {
-			cl.claims[0].Spec.NodeClassRef.Group = "example.com"
-		}, "does not reference a node class of group karpenter.azure.com"},
+			cl.claims[0].Spec.NodeClassRef.Group = "karpenter.azure.com"
+		}, "does not reference a node class of group multiregion.io"},
 		"a node not registered yet": {func(cl *cluster) { delete(cl.nodes[1].Labels, karpv1.NodeRegisteredLabelKey) }, "not registered yet"},
 		"a placed NodeClaim whose node has no annotation yet": {func(cl *cluster) {
 			cl.nodes[1].Annotations = nil

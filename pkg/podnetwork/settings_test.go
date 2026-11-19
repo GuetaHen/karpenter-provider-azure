@@ -49,11 +49,11 @@ func TestSettingsFromEnv(t *testing.T) {
 	g.Expect(s.Config.VNI()).To(Equal(testConfig(t).VNI()))
 
 	all := maps.Clone(required)
-	maps.Copy(all, map[string]string{"NODE_CLASS_GROUP": "example.com", "TRANSIT_PREFIX": "169.254.128.0/20",
+	maps.Copy(all, map[string]string{"NODE_CLASS_GROUP": "multiregion.io", "TRANSIT_PREFIX": "169.254.128.0/20",
 		"STARTUP_TAINT_KEY": "example.com/pod-network", "PROBE_ADDRESS": "127.0.0.1:9999"})
 	s, err = SettingsFromEnv(lookupIn(all))
 	g.Expect(err).ToNot(HaveOccurred())
-	g.Expect(s.Config.NodeClassGroup).To(Equal("example.com"))
+	g.Expect(s.Config.NodeClassGroup).To(Equal("multiregion.io"))
 	g.Expect(s.Config.TransitPrefix).To(Equal(netip.MustParsePrefix("169.254.128.0/20")))
 	g.Expect(s.StartupTaintKey).To(Equal("example.com/pod-network"))
 	g.Expect(s.ProbeAddress).To(Equal("127.0.0.1:9999"))

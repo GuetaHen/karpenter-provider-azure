@@ -39,6 +39,10 @@ func getResourceListQueryBuilder(rg string, resourceType string, includeAKSMachi
 		AddLiteral(` | where type == `).AddString(resourceType).
 		AddLiteral(` | where resourceGroup == `).AddString(strings.ToLower(rg)). // ARG resources appear to have lowercase RG
 		AddLiteral(` | where tags has_cs `).AddString(launchtemplate.NodePoolTagKey)
+	if owner := launchtemplate.OwnerTagValue(); owner != "" {
+		// Coexistence mode lists only the resources this controller created.
+		queryBuilder.AddLiteral(` | where tostring(tags[`).AddString(launchtemplate.OwnerTagKey).AddLiteral(`]) == `).AddString(owner)
+	}
 	if !includeAKSMachineResources {
 		queryBuilder.AddLiteral(` | where not(tags has_cs `).AddString(launchtemplate.KarpenterAKSMachineNodeClaimTagKey).AddLiteral(`)`)
 	}

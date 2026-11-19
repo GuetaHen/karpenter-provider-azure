@@ -24,6 +24,8 @@ import (
 
 	sdkerrors "github.com/Azure/azure-sdk-for-go-extensions/pkg/errors"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis"
+	"github.com/Azure/karpenter-provider-azure/pkg/apis/coexistence"
 	"github.com/Azure/karpenter-provider-azure/pkg/apis/v1beta1"
 	"github.com/Azure/karpenter-provider-azure/pkg/consts"
 	"github.com/Azure/karpenter-provider-azure/pkg/operator/options"
@@ -31,13 +33,25 @@ import (
 	"github.com/Azure/karpenter-provider-azure/pkg/providers/imagefamily"
 	"github.com/blang/semver/v4"
 	"github.com/samber/lo"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
-	DiskEncryptionSetRBACMissing      = "DiskEncryptionSetRBACMissing"
-	FIPSRequired                      = "FIPSRequired"
+	DiskEncryptionSetRBACMissing = "DiskEncryptionSetRBACMissing"
+	FIPSRequired                 = "FIPSRequired"
+	// ForeignNodeClassCheckForbidden is the condition reason set in coexistence mode when the
+	// controller may not get AKSNodeClasses of the default API group, so it cannot rule out a
+	// name conflict.
+	ForeignNodeClassCheckForbidden = "ForeignNodeClassCheckForbidden"
+	// ForeignNodeClassNameConflict is the condition reason set in coexistence mode when an
+	// AKSNodeClass of the default API group has the same name.
+	ForeignNodeClassNameConflict      = "ForeignNodeClassNameConflict"
 	IncompatibleProvisionMode         = "IncompatibleProvisionMode"
 	SIGRequiredForAzureContainerLinux = "SIGRequiredForAzureContainerLinux"
 	// ImageFamilyKubernetesVersionIncompatible identifies a pinned Ubuntu family
@@ -52,6 +66,9 @@ const (
 	// ValidationFailureRequeueInterval defines how often to retry DES RBAC validation after auth failure
 	// Set to 1 minute to detect when permissions are granted without creating a high system load
 	ValidationFailureRequeueInterval = 1 * time.Minute
+	// ForeignNodeClassRecheckInterval replaces ValidationSuccessRequeueInterval in coexistence mode:
+	// no watch reports a new AKSNodeClass of the default API group, so the name check is repeated.
+	ForeignNodeClassRecheckInterval = 5 * time.Minute
 	// DiskEncryptionSetRBACErrorMessage is the error message shown when the controlling identity lacks Reader permissions
 	DiskEncryptionSetRBACErrorMessage = "controlling identity does not have Reader role on Disk Encryption Set"
 	// KataPodSandboxingUnsupportedProvisionMode is the condition reason set when a NodeClass requests a
@@ -82,6 +99,17 @@ const (
 type StaticValidationReconciler struct {
 	diskEncryptionSetsAPI     azapi.DiskEncryptionSetsAPI
 	parsedDiskEncryptionSetID *arm.ResourceID // parsed by options.Validate(), will be nil if DiskEncryptionSetID is not set
+	// nodeClassReader lets coexistence mode find an AKSNodeClass of the default API group with the
+	// same name; nil disables that check.
+	nodeClassReader client.Reader
+}
+
+// WithNodeClassReader enables the coexistence-mode check for an AKSNodeClass of the default API
+// group with the same name. The check gets only object metadata, so an uncached reader needs no
+// list or watch permission.
+func (r *StaticValidationReconciler) WithNodeClassReader(reader client.Reader) *StaticValidationReconciler {
+	r.nodeClassReader = reader
+	return r
 }
 
 // validator defines the signature for a static validation function that checks an AKSNodeClass.
@@ -132,6 +160,7 @@ func NewStaticValidationReconciler(
 func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (reconcile.Result, error) {
 	validators := []validator{
 		r.validateRegions,
+		r.validateForeignNodeClassName,
 		r.validateKubernetesVersion,
 		r.validateFIPS,
 		r.validateACLConfiguration,
@@ -163,6 +192,9 @@ func (r *StaticValidationReconciler) Reconcile(ctx context.Context, nodeClass *v
 
 	// All validations passed - requeue to detect permission revocations
 	nodeClass.StatusConditions().SetTrue(v1beta1.ConditionTypeValidationSucceeded)
+	if coexistence.Enabled() && r.nodeClassReader != nil {
+		return reconcile.Result{RequeueAfter: ForeignNodeClassRecheckInterval}, nil
+	}
 	return reconcile.Result{RequeueAfter: ValidationSuccessRequeueInterval}, nil
 }
 
@@ -171,6 +203,34 @@ func (r *StaticValidationReconciler) validateRegions(ctx context.Context, nodeCl
 		return fail(options.RegionsErrorReason(err), err.Error()), nil
 	}
 	return pass(), nil
+}
+
+// validateForeignNodeClassName fails, in coexistence mode, a NodeClass whose name an AKSNodeClass of
+// the default API group also has, whether or not anything references that class. Controllers
+// outside coexistence mode resolve a NodeClaim's node class by kind and name only, so once such a
+// class exists their in-place update rewrites the tags of this controller's VMs and removes the
+// owner tag, after which this controller no longer lists or deletes those VMs.
+func (r *StaticValidationReconciler) validateForeignNodeClassName(ctx context.Context, nodeClass *v1beta1.AKSNodeClass) (validationResult, error) {
+	if !coexistence.Enabled() || r.nodeClassReader == nil {
+		return pass(), nil
+	}
+	foreign := &metav1.PartialObjectMetadata{}
+	foreign.SetGroupVersionKind(schema.GroupVersionKind{Group: apis.Group, Version: "v1beta1", Kind: v1beta1.AKSNodeClassKind})
+	err := r.nodeClassReader.Get(ctx, client.ObjectKey{Name: nodeClass.Name}, foreign)
+	switch {
+	case err == nil:
+		return retryableFail(ForeignNodeClassNameConflict,
+			fmt.Sprintf("an AKSNodeClass of API group %s is also named %s; controllers outside coexistence mode match NodeClaims by node class name and would rewrite the tags of this controller's virtual machines, so rename this AKSNodeClass", apis.Group, nodeClass.Name),
+			ValidationFailureRequeueInterval), nil
+	case apierrors.IsNotFound(err), meta.IsNoMatchError(err):
+		return pass(), nil
+	case apierrors.IsForbidden(err):
+		return retryableFail(ForeignNodeClassCheckForbidden,
+			fmt.Sprintf("checking for an AKSNodeClass of API group %s named %s needs get permission on aksnodeclasses.%s: %v", apis.Group, nodeClass.Name, apis.Group, err),
+			ValidationFailureRequeueInterval), nil
+	default:
+		return validationResult{}, fmt.Errorf("checking for an AKSNodeClass of API group %s named %s: %w", apis.Group, nodeClass.Name, err)
+	}
 }
 
 // Validates the Kubernetes version from AKSNodeClass to catch problems early before other validators

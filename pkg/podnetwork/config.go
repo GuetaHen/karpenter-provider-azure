@@ -35,7 +35,7 @@ type Config struct {
 	// NodeResourceGroupID is the ARM ID of the resource group that holds the VMs of all nodes.
 	NodeResourceGroupID string
 	// NodeClassGroup is the API group of the node classes of the controller that creates regional
-	// nodes, karpenter.azure.com unless set.
+	// nodes: karpenter.azure.com, or multiregion.io in coexistence mode.
 	NodeClassGroup string
 	// TransitPrefix holds the transit addresses of the nodes, one for every /24 of the pod CIDR.
 	TransitPrefix netip.Prefix

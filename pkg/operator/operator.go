@@ -140,6 +140,7 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 
 	log.FromContext(ctx).V(0).Info("Initial AZConfig", "azConfig", azConfig.String())
 
+	lo.Must0(options.ValidateCoexistenceFeatureGates(coreoptions.FromContext(ctx).FeatureGates.CapacityBuffer), "validating coexistence mode")
 	lo.Must0(options.FromContext(ctx).ValidateHomeLocation(azConfig.Location), "validating multi-region options")
 
 	env, err := auth.ResolveCloudEnvironment(azConfig)
@@ -530,7 +531,7 @@ func getCredential(env *auth.Environment) (azcore.TokenCredential, error) {
 func getRequiredGVKs(ctx context.Context) []schema.GroupVersionKind {
 	// controller-runtime internal, ignore them as we don't watch them
 	internalTypes := []string{"WatchEvent", "UpdateOptions", "DeleteOptions", "ListOptions", "CreateOptions", "PatchOptions", "GetOptions"}
-	requiredGroups := []string{karpapis.Group, v1beta1.Group}
+	requiredGroups := []string{karpapis.Group, v1beta1.SchemeGroupVersion.Group}
 	if coreoptions.FromContext(ctx).FeatureGates.CapacityBuffer {
 		requiredGroups = append(requiredGroups, autoscalingv1beta1.Group)
 	}
